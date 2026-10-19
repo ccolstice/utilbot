@@ -109,6 +109,7 @@ capture_router.message.filter(WhitelistFilter(settings))
 dp.include_router(capture_router)
 
 pending_media: dict[int, Message] = {}
+capture_locks: dict[int, asyncio.Lock] = {}
 search_sessions: dict[str, dict[str, Any]] = {}
 health_server: HealthServer | None = None
 backup_recipients: tuple[int, ...] = tuple(sorted(settings.owner_user_ids or settings.allowed_user_ids))
@@ -384,8 +385,11 @@ async def render_menu_panel(target, text: str, reply_markup=None, *, keep_item_p
                     reply_markup=None,
                 )
         if panel_id:
-            with suppress(Exception):
+            try:
                 await bot.delete_message(chat_id, panel_id)
+            except Exception as exc:
+                if "message to delete not found" not in str(exc).lower():
+                    logging.warning("Could not remove previous menu panel %s", panel_id, exc_info=True)
             _set_meta_value(f"menu_message_id:{user_id}", "")
         panel_id = None
 
@@ -824,8 +828,6 @@ async def show_next_inbox_item(target, user_id: int, *, skip_item_id: int | None
                 [InlineKeyboardButton(text="📥 К списку входящих", callback_data="menu:inbox")],
             ]),
         )
-        if isinstance(target, CallbackQuery):
-            await target.answer()
         return
 
     if not rows:
@@ -837,8 +839,6 @@ async def show_next_inbox_item(target, user_id: int, *, skip_item_id: int | None
                 [InlineKeyboardButton(text="🏠 Меню", callback_data="go_home")],
             ]),
         )
-        if isinstance(target, CallbackQuery):
-            await target.answer()
         return
 
     row = rows[0]
@@ -848,6 +848,7 @@ async def show_next_inbox_item(target, user_id: int, *, skip_item_id: int | None
         int(row["id"]),
         origin="review",
         page=1,
+        answer_callback=False,
         show_media_preview=True,
     )
 
@@ -2475,6 +2476,42 @@ async def move_folder_select_handler(callback: CallbackQuery, state: FSMContext)
         )
 
 
+async def _delete_archived_item(user_id: int, item_id: int) -> tuple[bool, bool]:
+    item = VaultService.get_item(user_id, item_id)
+    if not item:
+        return False, False
+
+    chat_id = int(item["archive_chat_id"] or user_id)
+    archive_removed = False
+    archive_message_id = item["archive_message_id"]
+    context_message_id = item["context_message_id"]
+
+    for message_id in (context_message_id, archive_message_id):
+        if not message_id:
+            continue
+        try:
+            await bot.delete_message(chat_id, int(message_id))
+            if message_id == archive_message_id:
+                archive_removed = True
+        except Exception:
+            logging.info(
+                "Could not delete Telegram archive message %s for item %s",
+                message_id,
+                item_id,
+                exc_info=True,
+            )
+
+    VaultService.delete_item(user_id, item_id)
+
+    preview_id = _get_meta_value(f"item_preview_message_id:{user_id}")
+    if preview_id:
+        with suppress(Exception):
+            await bot.delete_message(user_id, int(preview_id))
+        _set_meta_value(f"item_preview_message_id:{user_id}", "")
+
+    return True, archive_removed
+
+
 @dp.callback_query(F.data.startswith("delete_item_f_"))
 async def delete_item_folder_callback(callback: CallbackQuery):
     parts = callback.data.split("_")
@@ -2483,15 +2520,15 @@ async def delete_item_folder_callback(callback: CallbackQuery):
     page = int(parts[5])
     item_id = int(parts[6])
 
-    VaultService.delete_item(callback.from_user.id, item_id)
+    await _delete_archived_item(callback.from_user.id, item_id)
     await show_folder_items_page(callback, callback.from_user.id, folder_id, folders_page, page, edit=True)
 
 
 @dp.callback_query(F.data.startswith("review_delete_"))
 async def review_delete_item_callback(callback: CallbackQuery):
     item_id = int(callback.data.rsplit("_", 1)[1])
-    VaultService.delete_item(callback.from_user.id, item_id)
-    await callback.answer("Материал удалён")
+    _, archive_removed = await _delete_archived_item(callback.from_user.id, item_id)
+    await callback.answer("Материал и копия удалены" if archive_removed else "Запись удалена из каталога")
     await show_next_inbox_item(callback, callback.from_user.id, skip_item_id=item_id)
 
 
@@ -2501,7 +2538,7 @@ async def delete_item_all_callback(callback: CallbackQuery):
     page = int(parts[3])
     item_id = int(parts[4])
 
-    VaultService.delete_item(callback.from_user.id, item_id)
+    await _delete_archived_item(callback.from_user.id, item_id)
     await show_all_files_page(callback, callback.from_user.id, page, edit=True)
 
 
@@ -2512,7 +2549,7 @@ async def delete_item_search_callback(callback: CallbackQuery):
     page = int(parts[4])
     item_id = int(parts[5])
 
-    VaultService.delete_item(callback.from_user.id, item_id)
+    await _delete_archived_item(callback.from_user.id, item_id)
     await show_search_results_page(callback, session_id, page, edit=True)
 
 
@@ -2620,12 +2657,14 @@ async def state_open_item_handler(callback: CallbackQuery):
 @dp.callback_query(F.data == "inbox_review_start")
 async def inbox_review_start_handler(callback: CallbackQuery):
     await show_next_inbox_item(callback, callback.from_user.id)
+    await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("review_skip_"))
 async def inbox_review_skip_handler(callback: CallbackQuery):
     item_id = int(callback.data.rsplit("_", 1)[1])
     await show_next_inbox_item(callback, callback.from_user.id, skip_item_id=item_id)
+    await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("captured_open_"))
@@ -2798,6 +2837,14 @@ async def inbox_bulk_apply(callback: CallbackQuery):
 
 @capture_router.message()
 async def capture_incoming_message(message: Message, state: FSMContext):
+    if not message.from_user:
+        return
+    lock = capture_locks.setdefault(message.from_user.id, asyncio.Lock())
+    async with lock:
+        await _capture_incoming_message_locked(message, state)
+
+
+async def _capture_incoming_message_locked(message: Message, state: FSMContext):
     if (
         not message.from_user
         or message.chat.type != "private"
@@ -2819,7 +2866,12 @@ async def capture_incoming_message(message: Message, state: FSMContext):
             await message.delete()
             incoming_removed = True
         except Exception:
-            logging.info("Duplicate item %s detected; could not remove incoming message %s", duplicate["id"], message.message_id)
+            logging.warning(
+                "Duplicate item %s detected; could not remove incoming message %s",
+                duplicate["id"],
+                message.message_id,
+                exc_info=True,
+            )
         await _show_duplicate_item(message, duplicate, incoming_removed=incoming_removed)
         return
 
@@ -2876,6 +2928,12 @@ async def capture_incoming_message(message: Message, state: FSMContext):
             message_id=archive.message_id,
             reply_markup=None,
         )
+    source_removed = False
+    try:
+        await message.delete()
+        source_removed = True
+    except Exception:
+        logging.warning("Saved item %s, but the original message could not be deleted", item_id, exc_info=True)
     await show_item_view(
         message,
         message.from_user.id,
@@ -2884,11 +2942,8 @@ async def capture_incoming_message(message: Message, state: FSMContext):
         page=1,
         show_media_preview=False,
     )
-    try:
-        await message.delete()
-    except Exception:
-        logging.info("Saved item %s, but the original message could not be deleted", item_id)
-        await render_menu_panel(message, "✅ Сохранено во Входящие. Исходное сообщение не удалось удалить.", reply_markup=main_menu_keyboard())
+    if not source_removed:
+        logging.info("The archived copy is safe, but source message %s remains visible", message.message_id)
 
 
 @dp.callback_query(F.data.startswith("duplicate_open_"))
