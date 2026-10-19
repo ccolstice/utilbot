@@ -32,7 +32,6 @@ def more_menu_keyboard() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [
                 InlineKeyboardButton(text="🗂 Все файлы", callback_data="menu:all"),
-                InlineKeyboardButton(text="📄 OCR", callback_data="menu:ocr"),
             ],
             [
                 InlineKeyboardButton(text="📡 RSS-ленты", callback_data="menu:rss"),
@@ -486,7 +485,6 @@ def item_actions_keyboard(
     tag_callback: str,
     remind_callback: str,
     card_callback: str,
-    ocr_callback: str | None = None,
     context_callback: str | None = None,
     share_query: str | None = None,
     has_context: bool = False,
@@ -500,9 +498,6 @@ def item_actions_keyboard(
     else:
         rows.append([InlineKeyboardButton(text="🏷 Изменить тег", callback_data=tag_callback)])
     rows.append([InlineKeyboardButton(text="⏰ Напоминание", callback_data=remind_callback)])
-    if ocr_callback:
-        label = "📄 Распознать текст" if ocr_callback.startswith("item_ocr_run_") else "📄 Показать OCR"
-        rows.append([InlineKeyboardButton(text=label, callback_data=ocr_callback)])
     if context_callback:
         label = "✏️ Изменить контекст" if has_context else "🗒 Добавить контекст"
         rows.append([InlineKeyboardButton(text=label, callback_data=context_callback)])

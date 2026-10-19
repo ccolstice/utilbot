@@ -64,19 +64,17 @@ from src.keyboards.vault_keyboard import (
 )
 from src.services.vault_service import VaultService
 from src.handlers.reminders import router as reminders_router, show_reminders_page
-from src.handlers.ocr import router as ocr_router, OCRStates, _mode_keyboard
 from src.handlers.knowledge import router as knowledge_router, _show_favorites_page
 from src.services.reminder_service import reminder_worker
 from src.services.backup_service import BackupService, backup_worker
 from src.services.health_server import HealthServer
 from src.services.index_service import IndexService
 from src.services.media_service import MediaService
-from src.services.ocr_service import OCRService
 from src.services.link_service import LinkService
 from src.services.rss_service import RSSService
 from src.states.save_state import SaveStates
 from src.utils.search_parser import parse_search_request
-from src.utils.text_cleaner import safe_excerpt, normalize_multiline_input, normalize_ocr_text
+from src.utils.text_cleaner import safe_excerpt, normalize_multiline_input
 from src.utils.filters import WhitelistFilter, effective_allowed_user_ids, is_allowed_user, is_owner_user
 
 settings = get_settings()
@@ -102,7 +100,6 @@ dp.message.filter(WhitelistFilter(settings))
 dp.callback_query.filter(WhitelistFilter(settings))
 dp.inline_query.filter(WhitelistFilter(settings))
 dp.include_router(reminders_router)
-dp.include_router(ocr_router)
 dp.include_router(knowledge_router)
 capture_router = Router()
 capture_router.message.filter(WhitelistFilter(settings))
@@ -799,13 +796,6 @@ async def run_search_query(message: Message, raw_query: str, state: FSMContext):
     await show_search_results_page(message, sid, page=1)
 
 
-async def _send_item_text_details(target, title: str, body: str, back_callback: str):
-    header = f"{title}\n\n"
-    text = (body or "").strip()
-    shown = text if len(text) <= 3200 else safe_excerpt(text, 3200) + "\n\n(показана первая часть текста)"
-    await _edit_text_or_send(target, header + shown, reply_markup=back_keyboard(back_callback))
-
-
 async def show_home(target):
     text = (
         "🏠 Твоё личное хранилище\n\n"
@@ -1091,40 +1081,33 @@ async def show_item_view(
     sender = row["sender_name"] or "Unknown"
     dt = _format_dt(row["created_at"])
     tag = row["tag"] or "—"
-    ocr_status = row["ocr_status"] if "ocr_status" in row.keys() else None
-    extracted_text = row["extracted_text"] if "extracted_text" in row.keys() else None
 
     if origin == "review":
         back_callback = "state_page_inbox_1"
         delete_callback = f"review_delete_{item_id}"
         move_callback = f"item_move_r_{item_id}"
         tag_callback = f"item_tag_a_1_{item_id}"
-        ocr_callback = f"item_ocr_run_{item_id}" if row["kind"] == "photo" and not extracted_text else (f"item_ocr_a_1_{item_id}" if extracted_text else None)
     elif origin == "folder":
         back_callback = f"vault_items_page_{folder_id}_{folders_page}_{page}"
         delete_callback = f"delete_item_f_{folder_id}_{folders_page}_{page}_{item_id}"
         move_callback = f"item_move_f_{folder_id}_{folders_page}_{page}_{item_id}"
         tag_callback = f"item_tag_f_{folder_id}_{folders_page}_{page}_{item_id}"
-        ocr_callback = f"item_ocr_f_{folder_id}_{folders_page}_{page}_{item_id}" if extracted_text else (f"item_ocr_run_{item_id}" if row["kind"] == "photo" else None)
     elif origin == "search":
         back_callback = f"search_page_{session_id}_{page}"
         delete_callback = f"delete_item_s_{session_id}_{page}_{item_id}"
         move_callback = f"item_move_s_{session_id}_{page}_{item_id}"
         tag_callback = f"item_tag_s_{session_id}_{page}_{item_id}"
-        ocr_callback = f"item_ocr_s_{session_id}_{page}_{item_id}" if extracted_text else (f"item_ocr_run_{item_id}" if row["kind"] == "photo" else None)
     elif origin == "state":
         state_name = folder_id
         back_callback = f"state_page_{state_name}_{page or 1}"
         delete_callback = f"delete_item_a_{page or 1}_{item_id}"
         move_callback = f"item_move_a_{page or 1}_{item_id}"
         tag_callback = f"item_tag_a_{page or 1}_{item_id}"
-        ocr_callback = f"item_ocr_a_{page or 1}_{item_id}" if extracted_text else (f"item_ocr_run_{item_id}" if row["kind"] == "photo" else None)
     else:
         back_callback = f"vault_all_page_{page}"
         delete_callback = f"delete_item_a_{page}_{item_id}"
         move_callback = f"item_move_a_{page}_{item_id}"
         tag_callback = f"item_tag_a_{page}_{item_id}"
-        ocr_callback = f"item_ocr_a_{page}_{item_id}" if extracted_text else (f"item_ocr_run_{item_id}" if row["kind"] == "photo" else None)
 
     if back_callback_override:
         back_callback = back_callback_override
@@ -1145,7 +1128,6 @@ async def show_item_view(
         "move_callback": move_callback,
         "tag_callback": tag_callback,
         "remind_callback": remind_callback,
-        "ocr_callback": ocr_callback,
         "context_callback": context_callback,
     }
     _set_meta_value(f"item_view_state:{user_id}", json.dumps(view_state))
@@ -1177,17 +1159,6 @@ async def show_item_view(
     if row["context_text"]:
         header += "\n\n🗒 Контекст: " + safe_excerpt(row["context_text"], 700)
     if row["kind"] in media_kinds:
-        if row["kind"] == "photo":
-            if extracted_text:
-                header += "\n\n📄 OCR уже распознан. Открой «Ещё действия» → «Показать OCR»."
-            elif ocr_status == "processing":
-                header += "\n\n⏳ OCR выполняется…"
-            elif ocr_status == "error":
-                header += "\n\n⚠️ Ошибка OCR. Попробуй ещё раз; подробность записана в журнал Render."
-            elif ocr_status == "failed":
-                header += "\n\n⚠️ OCR не нашёл читаемый текст. Можно попробовать ещё раз."
-            else:
-                header += "\n\n📄 Если нужен OCR, открой «Ещё действия»."
         if content:
             header += "\n\n" + safe_excerpt(content, 1200)
         if show_media_preview:
@@ -1210,8 +1181,6 @@ async def show_item_view(
         header += f"\n\nТекст длинный ({len(content)} символов).\n\n{safe_excerpt(content, 2800)}"
     else:
         header += "\n\n" + content
-    if extracted_text:
-        header += "\n\n📄 OCR: " + safe_excerpt(extracted_text, 900)
     await render_menu_panel(target, header, markup)
     if answer_callback and isinstance(target, CallbackQuery):
         await target.answer()
@@ -1275,7 +1244,6 @@ async def item_more_actions_handler(callback: CallbackQuery):
         move_callback=None if data.get("origin") == "review" else data["move_callback"],
         tag_callback=data["tag_callback"],
         remind_callback=data["remind_callback"],
-        ocr_callback=data.get("ocr_callback"),
         context_callback=data.get("context_callback"),
         share_query=f"item:{item_id}",
         card_callback=f"item_return_{item_id}",
@@ -1335,15 +1303,6 @@ async def root_menu_callback(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
     elif action == "reminders":
         await show_reminders_page(callback, user_id, 1, edit=True)
-    elif action == "ocr":
-        await state.set_state(OCRStates.waiting_for_mode)
-        await state.update_data(ocr_mode="auto")
-        await render_menu_panel(
-            callback,
-            "📄 OCR\n\nВыбери режим, затем пришли фото или картинку.",
-            reply_markup=_mode_keyboard(),
-        )
-        await callback.answer()
     elif action == "help":
         await render_menu_panel(
             callback,
@@ -1515,7 +1474,7 @@ async def help_handler(message: Message):
         "📚 Просто отправь текст, ссылку, фото или файл — сохраню во Входящие.\n"
         "Исходник удалю после сохранения копии; при ошибке оставлю его.\n\n"
         "Кнопки меню ведут по одному экрану: переходы обновляют его, а не создают цепочку новых сообщений.\n\n"
-        "Папки создаются из раздела «Папки». OCR запускается только кнопкой в карточке фото. RSS находится в «Ещё».\n\n"
+        "Папки создаются из раздела «Папки». RSS находится в «Ещё».\n\n"
         "/backup — создать снимок базы в этом чате.\n"
         "/restore — ответить этой командой на сообщение со снимком.\n"
         "/status — проверить состояние и дату последнего снимка.",
@@ -1531,7 +1490,6 @@ async def status_command_handler(message: Message):
         "📊 Статус бота\n\n"
         f"• Health server: {'on' if health else 'off'}\n"
         f"• Каталог: {item_count} материалов\n"
-        f"• OCR по кнопке: {'включён' if settings.enable_ocr else 'выключен в настройках хостинга'}\n"
         f"• Backup recipients: {len(backup_recipients)}\n"
         f"• Автобэкап: раз в {settings.backup_interval_hours} ч.\n"
         f"• Последний бэкап: {last_backup}"
@@ -2033,125 +1991,6 @@ async def open_item_search_callback(callback: CallbackQuery):
         session_id=session_id,
     )
 
-
-@dp.callback_query(F.data.startswith("item_ocr_f_"))
-async def item_ocr_folder_callback(callback: CallbackQuery):
-    parts = callback.data.split("_")
-    folder_id = int(parts[3])
-    folders_page = int(parts[4])
-    page = int(parts[5])
-    item_id = int(parts[6])
-    row = VaultService.get_item(callback.from_user.id, item_id)
-    if not row:
-        await callback.answer("Item не найден", show_alert=True)
-        return
-    text = row["extracted_text"] if "extracted_text" in row.keys() else None
-    if not text:
-        await callback.answer("OCR текста пока нет", show_alert=True)
-        return
-    await _send_item_text_details(
-        callback,
-        "📄 OCR Текст",
-        text,
-        f"open_item_f_{folder_id}_{folders_page}_{page}_{item_id}",
-    )
-
-@dp.callback_query(F.data.startswith("item_ocr_a_"))
-async def item_ocr_all_callback(callback: CallbackQuery):
-    parts = callback.data.split("_")
-    page = int(parts[3])
-    item_id = int(parts[4])
-    row = VaultService.get_item(callback.from_user.id, item_id)
-    if not row:
-        await callback.answer("Item не найден", show_alert=True)
-        return
-    text = row["extracted_text"] if "extracted_text" in row.keys() else None
-    if not text:
-        await callback.answer("OCR текста пока нет", show_alert=True)
-        return
-    await _send_item_text_details(
-        callback,
-        "📄 OCR Текст",
-        text,
-        f"open_item_a_{page}_{item_id}",
-    )
-
-@dp.callback_query(F.data.startswith("item_ocr_s_"))
-async def item_ocr_search_callback(callback: CallbackQuery):
-    parts = callback.data.split("_")
-    session_id = parts[3]
-    page = int(parts[4])
-    item_id = int(parts[5])
-    row = VaultService.get_item(callback.from_user.id, item_id)
-    if not row:
-        await callback.answer("Item не найден", show_alert=True)
-        return
-    text = row["extracted_text"] if "extracted_text" in row.keys() else None
-    if not text:
-        await callback.answer("OCR текста пока нет", show_alert=True)
-        return
-    await _send_item_text_details(
-        callback,
-        "📄 OCR Текст",
-        text,
-        f"open_item_s_{session_id}_{page}_{item_id}",
-    )
-
-
-@dp.callback_query(F.data.startswith("item_ocr_run_"))
-async def run_saved_photo_ocr(callback: CallbackQuery):
-    item_id = int(callback.data.rsplit("_", 1)[1])
-    user_id = callback.from_user.id
-    row = VaultService.get_item(user_id, item_id)
-    if not row or row["kind"] != "photo":
-        await callback.answer("Фото не найдено", show_alert=True)
-        return
-    if not settings.enable_ocr:
-        await callback.answer(
-            "OCR выключен. В настройках хостинга включи ENABLE_OCR=1 и установи OCR-зависимости.",
-            show_alert=True,
-        )
-        return
-    service = OCRService(mode="auto")
-    if not service.available:
-        await callback.answer(service.availability_error or "OCR не настроен на хостинге.", show_alert=True)
-        return
-
-    temp_dir = Path("data/media_tmp")
-    temp_dir.mkdir(parents=True, exist_ok=True)
-    temp_path = temp_dir / f"ocr-{uuid.uuid4().hex}.jpg"
-    await callback.answer("Распознаю текст…")
-    VaultService.update_media_processing_started(user_id, item_id, ocr_status="processing")
-    try:
-        tg_file = await bot.get_file(row["telegram_file_id"])
-        await bot.download_file(tg_file.file_path, destination=temp_path)
-        extracted = await asyncio.to_thread(service.extract_text, temp_path)
-        extracted = normalize_ocr_text(extracted)
-        status = "done" if extracted else "failed"
-        if not extracted:
-            logging.info("On-demand OCR found no readable text for item %s", item_id)
-        VaultService.update_media_processing_result(
-            item_id,
-            extracted_text=extracted or "",
-            ocr_status=status,
-        )
-    except Exception:
-        logging.exception("On-demand OCR failed for item %s", item_id)
-        VaultService.update_media_processing_result(item_id, ocr_status="error")
-    finally:
-        temp_path.unlink(missing_ok=True)
-
-    await show_item_view(
-        callback,
-        user_id,
-        item_id,
-        origin="all",
-        page=1,
-        answer_callback=False,
-        show_media_preview=(
-            _saved_item_view_state(user_id, item_id) or {}
-        ).get("show_media_preview", True),
-    )
 
 @dp.callback_query(F.data.startswith("item_move_f_"))
 async def item_move_folder_callback(callback: CallbackQuery, state: FSMContext):

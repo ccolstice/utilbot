@@ -9,7 +9,6 @@ def _searchable_blob(row) -> str:
         row["title"] if "title" in row.keys() else None,
         row["content"] if "content" in row.keys() else None,
         row["tag"] if "tag" in row.keys() else None,
-        row["extracted_text"] if "extracted_text" in row.keys() else None,
         row["transcript_text"] if "transcript_text" in row.keys() else None,
         row["file_name"] if "file_name" in row.keys() else None,
         row["sender_name"] if "sender_name" in row.keys() else None,
@@ -69,7 +68,7 @@ class SearchService:
                 folder_id=folder_id,
                 kind=kind,
                 include_archived=include_archived,
-                deep=parsed.deep or deep or kind in {"ocr", "transcript"} or bool(tags),
+                deep=parsed.deep or deep or kind == "transcript" or bool(tags),
                 tags=tags or None,
                 domain=domain,
                 sender=sender,
@@ -80,9 +79,7 @@ class SearchService:
                 limit=max(10000, limit),
             )
 
-        if kind == "ocr":
-            rows = [row for row in rows if row["kind"] == "photo"]
-        elif kind == "transcript":
+        if kind == "transcript":
             rows = [row for row in rows if row["kind"] in {"voice", "audio"}]
 
         if tags:

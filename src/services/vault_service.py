@@ -184,11 +184,9 @@ class VaultService:
 
     @staticmethod
     def _media_default_status(kind: str):
-        if kind == "photo":
-            return "not_requested", None
         if kind in {"voice", "audio"}:
-            return None, "not_requested"
-        return None, None
+            return "not_requested"
+        return None
 
     @staticmethod
     def _normalize_tags(tag: str | None, *texts: str | None):
@@ -209,9 +207,7 @@ class VaultService:
         item_state: str = "saved",
         dedupe_key: str | None = None,
         voice_duration: int | None = None,
-        extracted_text: str | None = None,
         transcript_text: str | None = None,
-        ocr_status: str | None = None,
         transcript_status: str | None = None,
         processing_started_at: str | None = None,
         processing_completed_at: str | None = None,
@@ -234,14 +230,11 @@ class VaultService:
         is_favorite: int = 0,
         favorited_at: str | None = None,
     ):
-        default_ocr, default_transcript = VaultService._media_default_status(kind)
-        if ocr_status is None:
-            ocr_status = default_ocr
         if transcript_status is None:
-            transcript_status = default_transcript
+            transcript_status = VaultService._media_default_status(kind)
 
         manual_tag = format_tags(manual_tag if manual_tag is not None else tag)
-        tag = VaultService._normalize_tags(tag, content, extracted_text, transcript_text, file_name)
+        tag = VaultService._normalize_tags(tag, content, transcript_text, file_name)
 
         conn = get_connection()
         conn.execute(
@@ -258,9 +251,7 @@ class VaultService:
                 item_state,
                 dedupe_key,
                 voice_duration,
-                extracted_text,
                 transcript_text,
-                ocr_status,
                 transcript_status,
                 processing_started_at,
                 processing_completed_at,
@@ -297,9 +288,9 @@ class VaultService:
                 item_state,
                 dedupe_key,
                 voice_duration,
-                extracted_text,
+                None,
                 transcript_text,
-                ocr_status,
+                None,
                 transcript_status,
                 processing_started_at,
                 processing_completed_at,
@@ -623,7 +614,6 @@ class VaultService:
         user_id: int | None,
         item_id: int,
         *,
-        ocr_status: str | None = None,
         transcript_status: str | None = None,
     ):
         conn = get_connection()
@@ -633,11 +623,10 @@ class VaultService:
             UPDATE vault_items
             SET processing_started_at = ?,
                 processing_completed_at = NULL,
-                ocr_status = COALESCE(?, ocr_status),
                 transcript_status = COALESCE(?, transcript_status)
             WHERE id = ?
             """,
-            (now, ocr_status, transcript_status, item_id),
+            (now, transcript_status, item_id),
         )
         conn.commit()
         row = conn.execute("SELECT * FROM vault_items WHERE id = ?", (item_id,)).fetchone()
@@ -649,9 +638,7 @@ class VaultService:
     def update_media_processing_result(
         item_id: int,
         *,
-        extracted_text: str | None = None,
         transcript_text: str | None = None,
-        ocr_status: str | None = None,
         transcript_status: str | None = None,
         processing_completed_at: str | None = None,
     ):
@@ -667,17 +654,13 @@ class VaultService:
         conn.execute(
             """
             UPDATE vault_items
-            SET extracted_text = COALESCE(?, extracted_text),
-                transcript_text = COALESCE(?, transcript_text),
-                ocr_status = COALESCE(?, ocr_status),
+            SET transcript_text = COALESCE(?, transcript_text),
                 transcript_status = COALESCE(?, transcript_status),
                 processing_completed_at = ?
             WHERE id = ?
             """,
             (
-                extracted_text,
                 transcript_text,
-                ocr_status,
                 transcript_status,
                 processing_completed_at,
                 item_id,
@@ -717,10 +700,7 @@ class VaultService:
 
         if kind:
             normalized_kind = kind.lower()
-            if normalized_kind == "ocr":
-                clauses.append("i.kind = 'photo'")
-                deep = True
-            elif normalized_kind == "transcript":
+            if normalized_kind == "transcript":
                 clauses.append("i.kind IN ('voice', 'audio')")
                 deep = True
             elif normalized_kind == "link":
@@ -768,7 +748,6 @@ class VaultService:
                 "LOWER(COALESCE(i.content, '')) LIKE ?",
                 "LOWER(COALESCE(i.context_text, '')) LIKE ?",
                 "LOWER(COALESCE(i.tag, '')) LIKE ?",
-                "LOWER(COALESCE(i.extracted_text, '')) LIKE ?",
                 "LOWER(COALESCE(i.transcript_text, '')) LIKE ?",
                 "LOWER(COALESCE(i.file_name, '')) LIKE ?",
                 "LOWER(COALESCE(i.page_title, '')) LIKE ?",

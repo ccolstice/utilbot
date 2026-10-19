@@ -15,7 +15,7 @@ KEYWORD_HINTS = {
     "error": ["error", "ошибка", "traceback", "exception", "fail", "failed"],
     "code": ["python", "aiogram", "sqlite", "api", "code", "код", "скрипт"],
     "voice": ["voice", "audio", "transcript", "speech", "голос", "аудио", "транскрипт"],
-    "image": ["photo", "image", "ocr", "скрин", "screenshot", "picture", "картинка"],
+    "image": ["photo", "image", "скрин", "screenshot", "picture", "картинка"],
     "work": ["work", "job", "задача", "task", "рабочее", "project", "проект"],
     "idea": ["idea", "идея", "feature", "фича", "todo", "think"],
     "readlater": ["read later", "readlater", "посмотреть позже", "почитать позже", "later"],

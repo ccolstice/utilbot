@@ -219,9 +219,6 @@ def init_db():
     CREATE INDEX IF NOT EXISTS idx_vault_items_user_content
         ON vault_items(user_id, content);
 
-    CREATE INDEX IF NOT EXISTS idx_vault_items_user_extracted
-        ON vault_items(user_id, extracted_text);
-
     CREATE INDEX IF NOT EXISTS idx_vault_items_user_transcript
         ON vault_items(user_id, transcript_text);
 

@@ -2,10 +2,6 @@ from __future__ import annotations
 
 import re
 
-BOX_DRAWING_CHARS = set("│┆┊┃┗┛┏┓┳┻┣┫╋╠╣═║╚╗╔╝─┼╶╷╸╺╼╾")
-OCR_ARTIFACTS = {"Me", "Mе", "№", "[]", "()", "[ ]", "{ }"}
-
-
 def normalize_whitespace(text: str | None) -> str:
     if not text:
         return ""
@@ -43,73 +39,3 @@ def remove_noise(text: str | None) -> str:
     clean = normalize_whitespace(text)
     clean = re.sub(r"[\u200b\u200c\u200d]", "", clean)
     return clean.strip()
-
-
-def _is_ocr_artifact_line(line: str) -> bool:
-    stripped = line.strip()
-    if not stripped:
-        return True
-
-    if stripped in OCR_ARTIFACTS:
-        return True
-
-    letters = sum(ch.isalpha() for ch in stripped)
-    digits = sum(ch.isdigit() for ch in stripped)
-    alnum = letters + digits
-    nonspace = sum(not ch.isspace() for ch in stripped)
-    box_count = sum(ch in BOX_DRAWING_CHARS for ch in stripped)
-    symbols = sum((not ch.isalnum()) and (not ch.isspace()) for ch in stripped)
-
-    if stripped in {"|", "||", "|||", "||||"}:
-        return True
-
-    if nonspace <= 2 and alnum == 0:
-        return True
-
-    if letters == 0 and alnum < 2:
-        return True
-
-    if box_count and letters == 0 and alnum < 3:
-        return True
-
-    if len(stripped) >= 4 and alnum / max(1, len(stripped)) < 0.18:
-        return True
-
-    if len(stripped) >= 6 and symbols / max(1, len(stripped)) > 0.55:
-        return True
-
-    return False
-
-
-def normalize_ocr_text(text: str | None) -> str:
-    if not text:
-        return ""
-
-    text = normalize_multiline_input(text).replace("\r", "\n")
-    out_lines: list[str] = []
-    last_blank = False
-
-    for raw_line in text.split("\n"):
-        line = re.sub(r"[ \t]+", " ", raw_line).strip()
-        if not line:
-            if out_lines and not last_blank:
-                out_lines.append("")
-            last_blank = True
-            continue
-
-        if _is_ocr_artifact_line(line):
-            continue
-
-        line = re.sub(r"(?<!\w)[\|╚╔╩╦╠╣┐┌└┘─]+(?!\w)", "", line).strip()
-        if not line:
-            continue
-
-        out_lines.append(line)
-        last_blank = False
-
-    while out_lines and out_lines[0] == "":
-        out_lines.pop(0)
-    while out_lines and out_lines[-1] == "":
-        out_lines.pop()
-
-    return "\n".join(out_lines)

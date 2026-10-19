@@ -19,11 +19,10 @@ TYPE_ALIASES = {
     "text": "text",
     "link": "link",
     "links": "link",
-    "ocr": "ocr",
     "transcript": "transcript",
 }
 
-DEEP_HINTS = {"deep", "ai", "media", "ocr", "transcript", "fav", "favorite"}
+DEEP_HINTS = {"deep", "ai", "media", "transcript", "fav", "favorite"}
 
 
 @dataclass(slots=True)
@@ -66,7 +65,7 @@ def parse_search_request(raw: str | None, *, deep_default: bool = False) -> Sear
         if low in DEEP_HINTS:
             if low in {"deep", "ai", "media"}:
                 deep = True
-            elif low in {"ocr", "transcript"}:
+            elif low == "transcript":
                 deep = True
                 kind = TYPE_ALIASES[low]
             continue
@@ -82,7 +81,7 @@ def parse_search_request(raw: str | None, *, deep_default: bool = False) -> Sear
         if low.startswith("type:") or low.startswith("kind:"):
             value = low.split(":", 1)[1].strip()
             kind = TYPE_ALIASES.get(value, value if value else None)
-            if kind in {"ocr", "transcript"}:
+            if kind == "transcript":
                 deep = True
             continue
 

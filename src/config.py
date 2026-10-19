@@ -46,7 +46,6 @@ class Settings:
     database_path: Path
     host: str
     port: int
-    enable_ocr: bool
     enable_file_log: bool
     render_free_mode: bool
     backup_interval_hours: int
@@ -77,7 +76,6 @@ def get_settings() -> Settings:
         database_path=db_path,
         host=os.getenv("HOST", "0.0.0.0"),
         port=_env_int("PORT", 8080),
-        enable_ocr=_env_bool("ENABLE_OCR", "0"),
         enable_file_log=_env_bool("ENABLE_FILE_LOG", "0"),
         render_free_mode=render_free_mode,
         backup_interval_hours=max(24, min(_env_int("BACKUP_INTERVAL_HOURS", 24), 48)),
