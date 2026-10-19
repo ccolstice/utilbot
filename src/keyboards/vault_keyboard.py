@@ -72,6 +72,7 @@ def state_items_keyboard(rows, *, state: str, page: int, total_pages: int) -> In
     if nav:
         keyboard.append(nav)
     if state == "inbox" and rows:
+        keyboard.append([InlineKeyboardButton(text="⚡ Разобрать по одному", callback_data="inbox_review_start")])
         keyboard.append([InlineKeyboardButton(text="✅ Разобрать все входящие", callback_data="inbox_bulk_confirm")])
     keyboard.append([
         InlineKeyboardButton(text="🏠 Меню", callback_data="go_home"),
@@ -442,6 +443,8 @@ def item_view_keyboard(
     favorite: bool = False,
     actions_callback: str | None = None,
     delete_callback: str | None = None,
+    review_next_callback: str | None = None,
+    review_move_callback: str | None = None,
 ) -> InlineKeyboardMarkup:
     rows = []
     if favorite_callback:
@@ -454,6 +457,14 @@ def item_view_keyboard(
         rows.append([button for button in (favorite_button, actions_button) if button])
     elif favorite_button:
         rows.append([favorite_button])
+
+    if review_move_callback or review_next_callback:
+        review_row = []
+        if review_move_callback:
+            review_row.append(InlineKeyboardButton(text="📁 В папку", callback_data=review_move_callback))
+        if review_next_callback:
+            review_row.append(InlineKeyboardButton(text="⏭ Пропустить", callback_data=review_next_callback))
+        rows.append(review_row)
 
     # Keep deletion on the main item screen, but isolated at the bottom to
     # reduce accidental taps while keeping it easy to find.
@@ -471,7 +482,7 @@ def item_view_keyboard(
 
 def item_actions_keyboard(
     *,
-    move_callback: str,
+    move_callback: str | None,
     tag_callback: str,
     remind_callback: str,
     card_callback: str,
@@ -480,13 +491,15 @@ def item_actions_keyboard(
     share_query: str | None = None,
     has_context: bool = False,
 ) -> InlineKeyboardMarkup:
-    rows = [
-        [
+    rows = []
+    if move_callback:
+        rows.append([
             InlineKeyboardButton(text="📁 Переместить в папку", callback_data=move_callback),
             InlineKeyboardButton(text="🏷 Изменить тег", callback_data=tag_callback),
-        ],
-        [InlineKeyboardButton(text="⏰ Напоминание", callback_data=remind_callback)],
-    ]
+        ])
+    else:
+        rows.append([InlineKeyboardButton(text="🏷 Изменить тег", callback_data=tag_callback)])
+    rows.append([InlineKeyboardButton(text="⏰ Напоминание", callback_data=remind_callback)])
     if ocr_callback:
         label = "📄 Распознать текст" if ocr_callback.startswith("item_ocr_run_") else "📄 Показать OCR"
         rows.append([InlineKeyboardButton(text=label, callback_data=ocr_callback)])

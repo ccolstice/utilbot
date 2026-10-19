@@ -806,6 +806,52 @@ async def show_state_items_page(target, user_id: int, item_state: str, page: int
         await _send_text(target, text, reply_markup=markup)
 
 
+async def show_next_inbox_item(target, user_id: int, *, skip_item_id: int | None = None):
+    rows = VaultService.list_items_by_state(user_id, "inbox")
+    if skip_item_id is not None:
+        current_index = next((i for i, row in enumerate(rows) if int(row["id"]) == skip_item_id), None)
+        if current_index is not None:
+            rows = rows[current_index + 1:] + rows[:current_index]
+        else:
+            rows = [row for row in rows if int(row["id"]) != skip_item_id]
+
+    if not rows and skip_item_id is not None and VaultService.count_items_by_state(user_id, "inbox"):
+        await render_menu_panel(
+            target,
+            "⏭ Других входящих пока нет. Этот материал пропущен и остался во входящих.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⚡ Вернуться к разбору", callback_data="inbox_review_start")],
+                [InlineKeyboardButton(text="📥 К списку входящих", callback_data="menu:inbox")],
+            ]),
+        )
+        if isinstance(target, CallbackQuery):
+            await target.answer()
+        return
+
+    if not rows:
+        await render_menu_panel(
+            target,
+            "✅ Входящие разобраны. Больше новых материалов нет.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📥 К списку входящих", callback_data="menu:inbox")],
+                [InlineKeyboardButton(text="🏠 Меню", callback_data="go_home")],
+            ]),
+        )
+        if isinstance(target, CallbackQuery):
+            await target.answer()
+        return
+
+    row = rows[0]
+    await show_item_view(
+        target,
+        user_id,
+        int(row["id"]),
+        origin="review",
+        page=1,
+        show_media_preview=True,
+    )
+
+
 async def show_folders_page(target, user_id: int, page: int, *, edit: bool = False):
     folders = VaultService.list_folders(user_id)
     if not folders:
@@ -1013,7 +1059,13 @@ async def show_item_view(
     ocr_status = row["ocr_status"] if "ocr_status" in row.keys() else None
     extracted_text = row["extracted_text"] if "extracted_text" in row.keys() else None
 
-    if origin == "folder":
+    if origin == "review":
+        back_callback = "state_page_inbox_1"
+        delete_callback = f"review_delete_{item_id}"
+        move_callback = f"item_move_r_{item_id}"
+        tag_callback = f"item_tag_a_1_{item_id}"
+        ocr_callback = f"item_ocr_run_{item_id}" if row["kind"] == "photo" and not extracted_text else (f"item_ocr_a_1_{item_id}" if extracted_text else None)
+    elif origin == "folder":
         back_callback = f"vault_items_page_{folder_id}_{folders_page}_{page}"
         delete_callback = f"delete_item_f_{folder_id}_{folders_page}_{page}_{item_id}"
         move_callback = f"item_move_f_{folder_id}_{folders_page}_{page}_{item_id}"
@@ -1068,6 +1120,8 @@ async def show_item_view(
         favorite=bool(row["is_favorite"]),
         actions_callback=f"item_more_{item_id}",
         delete_callback=delete_callback,
+        review_next_callback=f"review_skip_{item_id}" if origin == "review" else None,
+        review_move_callback=move_callback if origin == "review" else None,
     )
     current_state = row["item_state"] if "item_state" in row.keys() else "saved"
     markup.inline_keyboard.insert(0, item_state_buttons(item_id, current_state))
@@ -1083,6 +1137,8 @@ async def show_item_view(
         f"📂 {folder_name}\n👤 {sender}\n🕒 {dt}\n🏷 {tag}\n"
         f"#{item_id} · {kind_labels.get(row['kind'], row['kind'].title())}"
     )
+    if origin == "review":
+        header = "⚡ Разбор входящих\n\n" + header
     if row["context_text"]:
         header += "\n\n🗒 Контекст: " + safe_excerpt(row["context_text"], 700)
     if row["kind"] in media_kinds:
@@ -1179,7 +1235,7 @@ async def item_more_actions_handler(callback: CallbackQuery):
         return
 
     markup = item_actions_keyboard(
-        move_callback=data["move_callback"],
+        move_callback=None if data.get("origin") == "review" else data["move_callback"],
         tag_callback=data["tag_callback"],
         remind_callback=data["remind_callback"],
         ocr_callback=data.get("ocr_callback"),
@@ -2091,6 +2147,14 @@ async def item_move_all_callback(callback: CallbackQuery, state: FSMContext):
     await show_move_folders_page(callback, callback.from_user.id, page=1, edit=True)
 
 
+@dp.callback_query(F.data.startswith("item_move_r_"))
+async def item_move_review_callback(callback: CallbackQuery, state: FSMContext):
+    item_id = int(callback.data.rsplit("_", 1)[1])
+    await state.update_data(item_id=item_id, origin="review", show_media_preview=True)
+    await state.set_state(ItemMoveStates.waiting_for_folder)
+    await show_move_folders_page(callback, callback.from_user.id, page=1, edit=True)
+
+
 @dp.callback_query(F.data.startswith("item_move_s_"))
 async def item_move_search_callback(callback: CallbackQuery, state: FSMContext):
     parts = callback.data.split("_")
@@ -2375,7 +2439,11 @@ async def move_folder_select_handler(callback: CallbackQuery, state: FSMContext)
         return
 
     await state.clear()
-    if origin == "folder":
+    if origin == "review":
+        VaultService.set_item_state(callback.from_user.id, item_id, "saved")
+        await callback.answer("Перемещено в папку")
+        await show_next_inbox_item(callback, callback.from_user.id, skip_item_id=item_id)
+    elif origin == "folder":
         await show_item_view(
             callback,
             callback.from_user.id,
@@ -2417,6 +2485,14 @@ async def delete_item_folder_callback(callback: CallbackQuery):
 
     VaultService.delete_item(callback.from_user.id, item_id)
     await show_folder_items_page(callback, callback.from_user.id, folder_id, folders_page, page, edit=True)
+
+
+@dp.callback_query(F.data.startswith("review_delete_"))
+async def review_delete_item_callback(callback: CallbackQuery):
+    item_id = int(callback.data.rsplit("_", 1)[1])
+    VaultService.delete_item(callback.from_user.id, item_id)
+    await callback.answer("Материал удалён")
+    await show_next_inbox_item(callback, callback.from_user.id, skip_item_id=item_id)
 
 
 @dp.callback_query(F.data.startswith("delete_item_a_"))
@@ -2541,6 +2617,17 @@ async def state_open_item_handler(callback: CallbackQuery):
     )
 
 
+@dp.callback_query(F.data == "inbox_review_start")
+async def inbox_review_start_handler(callback: CallbackQuery):
+    await show_next_inbox_item(callback, callback.from_user.id)
+
+
+@dp.callback_query(F.data.startswith("review_skip_"))
+async def inbox_review_skip_handler(callback: CallbackQuery):
+    item_id = int(callback.data.rsplit("_", 1)[1])
+    await show_next_inbox_item(callback, callback.from_user.id, skip_item_id=item_id)
+
+
 @dp.callback_query(F.data.startswith("captured_open_"))
 async def captured_open_handler(callback: CallbackQuery):
     item_id = int(callback.data.rsplit("_", 1)[1])
@@ -2635,6 +2722,18 @@ async def item_state_callback(callback: CallbackQuery):
     item = VaultService.set_item_state(callback.from_user.id, item_id, new_state)
     if not item:
         await callback.answer("Материал не найден", show_alert=True)
+        return
+
+    view_data = _saved_item_view_state(callback.from_user.id, item_id)
+    if view_data and view_data.get("origin") == "review":
+        status_messages = {
+            "later": "Отложено на потом",
+            "done": "Отмечено как готовое",
+            "saved": "Разобрано",
+            "inbox": "Возвращено во входящие",
+        }
+        await callback.answer(status_messages.get(new_state, "Готово"))
+        await show_next_inbox_item(callback, callback.from_user.id, skip_item_id=item_id)
         return
 
     if callback.message:
