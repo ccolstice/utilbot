@@ -1182,6 +1182,8 @@ async def show_item_view(
                 header += "\n\n📄 OCR уже распознан. Открой «Ещё действия» → «Показать OCR»."
             elif ocr_status == "processing":
                 header += "\n\n⏳ OCR выполняется…"
+            elif ocr_status == "error":
+                header += "\n\n⚠️ Ошибка OCR. Попробуй ещё раз; подробность записана в журнал Render."
             elif ocr_status == "failed":
                 header += "\n\n⚠️ OCR не нашёл читаемый текст. Можно попробовать ещё раз."
             else:
@@ -2126,6 +2128,8 @@ async def run_saved_photo_ocr(callback: CallbackQuery):
         extracted = await asyncio.to_thread(service.extract_text, temp_path)
         extracted = normalize_ocr_text(extracted)
         status = "done" if extracted else "failed"
+        if not extracted:
+            logging.info("On-demand OCR found no readable text for item %s", item_id)
         VaultService.update_media_processing_result(
             item_id,
             extracted_text=extracted or "",
@@ -2133,7 +2137,7 @@ async def run_saved_photo_ocr(callback: CallbackQuery):
         )
     except Exception:
         logging.exception("On-demand OCR failed for item %s", item_id)
-        VaultService.update_media_processing_result(item_id, ocr_status="failed")
+        VaultService.update_media_processing_result(item_id, ocr_status="error")
     finally:
         temp_path.unlink(missing_ok=True)
 

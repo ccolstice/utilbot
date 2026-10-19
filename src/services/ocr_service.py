@@ -56,7 +56,7 @@ class OCRService:
             return False
         return True
 
-    def _prepare_image(self, path: str | Path):
+    def _prepare_images(self, path: str | Path) -> list[Image.Image]:
         if Image is None or ImageFilter is None or ImageOps is None:
             raise RuntimeError("Pillow is not installed")
         img = Image.open(path)
@@ -64,12 +64,18 @@ class OCRService:
         if img.mode != "L":
             img = img.convert("L")
         img = ImageOps.autocontrast(img)
-        if img.width < 1600:
-            img = img.resize((img.width * 2, img.height * 2))
-        # Median filtering removes thin strokes from small UI text and album labels.
-        # Keep the source detail and apply only a light sharpen filter.
-        img = img.filter(ImageFilter.SHARPEN)
-        return img
+        # Telegram often compresses images with small text. Enlarge them to a
+        # consistent working width before OCR, while preserving larger originals.
+        if img.width < 1800:
+            scale = min(3, max(2, (1800 + img.width - 1) // img.width))
+            img = img.resize((img.width * scale, img.height * scale), Image.Resampling.LANCZOS)
+
+        sharpened = img.filter(ImageFilter.SHARPEN)
+        # A black-on-white high-contrast variant helps text on dark cards and
+        # backgrounds; keep grayscale too because thresholding can erase thin text.
+        threshold = sharpened.point(lambda value: 255 if value >= 150 else 0)
+        threshold = ImageOps.invert(threshold)
+        return [sharpened, threshold]
 
     @staticmethod
     def _safe_index(seq, idx: int, default=0):
@@ -171,32 +177,31 @@ class OCRService:
         if not self.available:
             return None
 
-        img = self._prepare_image(path)
+        images = self._prepare_images(path)
         langs = self._language_candidates()
         candidates: list[tuple[float, str]] = []
         for lang in langs:
-            # PSM 11 handles screenshots with separated labels better than PSM 6,
-            # while PSM 6/4 remain useful for conventional text blocks.
-            for psm in (11, 6, 4):
-                text, score = self._reconstruct_from_data(img, lang, psm)
-                if text:
-                    candidates.append((score, text))
-                else:
-                    # Keep the plain-text path as a recall-oriented fallback for
-                    # layouts where Tesseract's confidence data is sparse or absent.
-                    try:
-                        fallback = pytesseract.image_to_string(
-                            img,
-                            lang=lang,
-                            config=f"--psm {psm} --oem 3",
-                            timeout=12,
-                        )
-                    except Exception:
-                        continue
-                    fallback = normalize_ocr_text(fallback)
-                    if fallback:
-                        word_count = len(fallback.split())
-                        candidates.append((25 + min(word_count, 30) * 5, fallback))
+            for img in images:
+                # PSM 11 handles separated labels; PSM 6/4 suit denser text.
+                for psm in (11, 6, 4):
+                    text, score = self._reconstruct_from_data(img, lang, psm)
+                    if text:
+                        candidates.append((score, text))
+                    else:
+                        # Keep the plain-text path when confidence data is sparse.
+                        try:
+                            fallback = pytesseract.image_to_string(
+                                img,
+                                lang=lang,
+                                config=f"--psm {psm} --oem 3",
+                                timeout=8,
+                            )
+                        except Exception:
+                            continue
+                        fallback = normalize_ocr_text(fallback)
+                        if fallback:
+                            word_count = len(fallback.split())
+                            candidates.append((25 + min(word_count, 30) * 5, fallback))
 
         if not candidates:
             return None
