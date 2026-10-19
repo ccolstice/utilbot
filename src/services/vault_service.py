@@ -274,7 +274,7 @@ class VaultService:
                 is_favorite,
                 favorited_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 user_id,
@@ -288,9 +288,7 @@ class VaultService:
                 item_state,
                 dedupe_key,
                 voice_duration,
-                None,
                 transcript_text,
-                None,
                 transcript_status,
                 processing_started_at,
                 processing_completed_at,
