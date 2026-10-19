@@ -13,7 +13,6 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="📥 Входящие", callback_data="menu:inbox"),
                 InlineKeyboardButton(text="🔎 Поиск", callback_data="menu:search"),
             ],
-            [InlineKeyboardButton(text="📤 Поделиться из архива", switch_inline_query="")],
             [
                 InlineKeyboardButton(text="⏳ На потом", callback_data="menu:later"),
                 InlineKeyboardButton(text="⭐ Избранное", callback_data="menu:favorites"),
@@ -442,6 +441,7 @@ def item_view_keyboard(
     favorite_callback: str | None = None,
     favorite: bool = False,
     actions_callback: str | None = None,
+    delete_callback: str | None = None,
 ) -> InlineKeyboardMarkup:
     rows = []
     if favorite_callback:
@@ -454,6 +454,11 @@ def item_view_keyboard(
         rows.append([button for button in (favorite_button, actions_button) if button])
     elif favorite_button:
         rows.append([favorite_button])
+
+    # Keep deletion on the main item screen, but isolated at the bottom to
+    # reduce accidental taps while keeping it easy to find.
+    if delete_callback:
+        rows.append([InlineKeyboardButton(text="🗑 Удалить материал", callback_data=delete_callback)])
 
     rows.append(
         [
@@ -469,7 +474,6 @@ def item_actions_keyboard(
     move_callback: str,
     tag_callback: str,
     remind_callback: str,
-    delete_callback: str,
     card_callback: str,
     ocr_callback: str | None = None,
     context_callback: str | None = None,
@@ -491,10 +495,7 @@ def item_actions_keyboard(
         rows.append([InlineKeyboardButton(text=label, callback_data=context_callback)])
     if share_query is not None:
         rows.append([InlineKeyboardButton(text="📤 Отправить в другой чат", switch_inline_query=share_query)])
-    rows.extend([
-        [InlineKeyboardButton(text="🗑 Удалить", callback_data=delete_callback)],
-        [InlineKeyboardButton(text="⬅️ К материалу", callback_data=card_callback)],
-    ])
+    rows.append([InlineKeyboardButton(text="⬅️ К материалу", callback_data=card_callback)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 

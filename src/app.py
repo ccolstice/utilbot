@@ -1067,6 +1067,7 @@ async def show_item_view(
         favorite_callback=favorite_callback,
         favorite=bool(row["is_favorite"]),
         actions_callback=f"item_more_{item_id}",
+        delete_callback=delete_callback,
     )
     current_state = row["item_state"] if "item_state" in row.keys() else "saved"
     markup.inline_keyboard.insert(0, item_state_buttons(item_id, current_state))
@@ -1181,7 +1182,6 @@ async def item_more_actions_handler(callback: CallbackQuery):
         move_callback=data["move_callback"],
         tag_callback=data["tag_callback"],
         remind_callback=data["remind_callback"],
-        delete_callback=data["delete_callback"],
         ocr_callback=data.get("ocr_callback"),
         context_callback=data.get("context_callback"),
         share_query=f"item:{item_id}",
