@@ -559,6 +559,39 @@ async def _save_text_payload(
     return item_id
 
 
+def _message_attribution(message: Message) -> tuple[str | None, str | None, str | None]:
+    """Return the original author for forwarded messages, otherwise the sender."""
+    origin = getattr(message, "forward_origin", None)
+    origin_type = getattr(origin, "type", None)
+
+    if origin_type == "user":
+        sender = getattr(origin, "sender_user", None)
+        if sender:
+            return sender.full_name, sender.username, None
+    elif origin_type == "hidden_user":
+        return getattr(origin, "sender_user_name", None), None, None
+    elif origin_type == "chat":
+        chat = getattr(origin, "sender_chat", None)
+        if chat:
+            return (
+                getattr(origin, "author_signature", None) or chat.title,
+                chat.username,
+                chat.title,
+            )
+    elif origin_type == "channel":
+        chat = getattr(origin, "chat", None)
+        if chat:
+            author = getattr(origin, "author_signature", None)
+            return author or chat.title, chat.username, chat.title
+
+    sender = message.from_user
+    return (
+        sender.full_name if sender else None,
+        sender.username if sender else None,
+        message.chat.title if message.chat else None,
+    )
+
+
 def _save_media_payload(
     user_id: int,
     folder_id: int,
@@ -570,9 +603,7 @@ def _save_media_payload(
     item_state: str = "saved",
     dedupe_key: str | None = None,
 ):
-    sender_name = message.from_user.full_name if message.from_user else None
-    sender_username = message.from_user.username if message.from_user else None
-    source_chat_title = message.chat.title if message.chat else None
+    sender_name, sender_username, source_chat_title = _message_attribution(message)
     source_chat_id = message.chat.id if message.chat else None
     source_message_id = message.message_id
 
@@ -2764,13 +2795,14 @@ async def _capture_incoming_message_locked(message: Message, state: FSMContext):
         )
         folder = VaultService.get_or_create_default_folder(message.from_user.id)
         if payload.kind == "text":
+            sender_name, sender_username, source_chat_title = _message_attribution(message)
             item_id = await _save_text_payload(
                 user_id=message.from_user.id,
                 folder_id=int(folder["id"]),
                 text=payload.content or "",
-                sender_name=message.from_user.full_name,
-                sender_username=message.from_user.username,
-                source_chat_title=message.chat.title,
+                sender_name=sender_name,
+                sender_username=sender_username,
+                source_chat_title=source_chat_title,
                 source_chat_id=message.chat.id,
                 source_message_id=message.message_id,
                 archive_chat_id=message.chat.id,
