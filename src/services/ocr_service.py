@@ -21,8 +21,10 @@ from src.utils.text_cleaner import normalize_ocr_text
 
 class OCRService:
     LANG_PRESETS = {
-        "auto": ["rus+eng", "eng+rus", "rus", "eng"],
-        "mixed": ["rus+eng", "eng+rus"],
+        # A single combined language model is preferable for mixed screenshots:
+        # trying rus and eng separately can turn Latin text into Cyrillic lookalikes.
+        "auto": ["rus+eng"],
+        "mixed": ["rus+eng"],
         "rus": ["rus"],
         "eng": ["eng"],
     }
@@ -64,7 +66,8 @@ class OCRService:
         img = ImageOps.autocontrast(img)
         if img.width < 1600:
             img = img.resize((img.width * 2, img.height * 2))
-        img = img.filter(ImageFilter.MedianFilter(size=3))
+        # Median filtering removes thin strokes from small UI text and album labels.
+        # Keep the source detail and apply only a light sharpen filter.
         img = img.filter(ImageFilter.SHARPEN)
         return img
 
@@ -103,33 +106,37 @@ class OCRService:
     def _language_candidates(self) -> list[str]:
         return self.LANG_PRESETS.get(self.mode, self.LANG_PRESETS["auto"])
 
-    def _reconstruct_from_data(self, img: Image.Image, lang: str) -> str:
+    def _reconstruct_from_data(self, img: Image.Image, lang: str, psm: int) -> tuple[str, float]:
         if pytesseract is None or Output is None:
-            return ""
+            return "", 0.0
 
         try:
             data = pytesseract.image_to_data(
                 img,
                 lang=lang,
-                config="--psm 6 --oem 3",
+                config=f"--psm {psm} --oem 3",
                 output_type=Output.DICT,
+                timeout=12,
             )
         except Exception:
-            return ""
+            return "", 0.0
 
         texts = data.get("text", [])
         if not texts:
-            return ""
+            return "", 0.0
 
         lines: dict[tuple[int, int, int], list[tuple[int, str, float]]] = {}
+        confidences: list[float] = []
         for idx, raw_text in enumerate(texts):
             text = (raw_text or "").strip()
             if not self._meaningful_token(text):
                 continue
 
             conf = self._normalize_conf(self._safe_index(data.get("conf", []), idx, -1))
-            if 0 <= conf < 35:
+            if 0 <= conf < 40:
                 continue
+            if conf >= 0:
+                confidences.append(conf)
 
             key = (
                 int(self._safe_index(data.get("block_num", []), idx, 0)),
@@ -141,13 +148,22 @@ class OCRService:
 
         ordered_lines: list[str] = []
         for key in sorted(lines.keys()):
-            words = [word for _, word, conf in sorted(lines[key], key=lambda item: item[0]) if conf < 0 or conf >= 35]
+            words = [word for _, word, conf in sorted(lines[key], key=lambda item: item[0]) if conf < 0 or conf >= 40]
             line = " ".join(words).strip()
             if not line:
                 continue
             ordered_lines.append(line)
 
-        return normalize_ocr_text("\n".join(ordered_lines))
+        text = normalize_ocr_text("\n".join(ordered_lines))
+        if not text:
+            return "", 0.0
+
+        # Prefer a useful, confidently recognized sparse-text result without
+        # allowing a few isolated high-confidence words to beat a fuller reading.
+        confidence = sum(confidences) / len(confidences) if confidences else 0.0
+        word_count = sum(len(line.split()) for line in ordered_lines)
+        score = confidence + min(word_count, 12) * 1.5
+        return text, score
 
     def extract_text(self, path: str | Path) -> str | None:
         if not self.available:
@@ -155,20 +171,15 @@ class OCRService:
 
         img = self._prepare_image(path)
         langs = self._language_candidates()
-        configs = ["--psm 6 --oem 3", "--psm 11 --oem 3", "--psm 4 --oem 3"]
-
+        candidates: list[tuple[float, str]] = []
         for lang in langs:
-            structured = self._reconstruct_from_data(img, lang)
-            if structured:
-                return structured
-
-            for config in configs:
-                try:
-                    text = pytesseract.image_to_string(img, lang=lang, config=config)
-                except Exception:
-                    continue
-                text = normalize_ocr_text(text)
+            # PSM 11 handles screenshots with separated labels better than PSM 6,
+            # while PSM 6/4 remain useful for conventional text blocks.
+            for psm in (11, 6, 4):
+                text, score = self._reconstruct_from_data(img, lang, psm)
                 if text:
-                    return text
+                    candidates.append((score, text))
 
-        return None
+        if not candidates:
+            return None
+        return max(candidates, key=lambda candidate: candidate[0])[1]
