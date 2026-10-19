@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: tg-util-bot
+    runtime: python
+    plan: free
+    buildCommand: bash render-build.sh
+    startCommand: python main.py
+    healthCheckPath: /health
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ALLOWED_USER_IDS
+        sync: false
+      - key: OWNER_USER_IDS
+        sync: false
+      - key: RENDER_FREE_MODE
+        value: "1"
+      - key: ENABLE_FILE_LOG
+        value: "0"
+      - key: ENABLE_OCR
+        value: "1"
+      - key: INSTALL_MEDIA_DEPS
+        value: "1"
+      - key: HOST
+        value: 0.0.0.0
+      - key: DATABASE_PATH
+        value: data/bot.sqlite3
