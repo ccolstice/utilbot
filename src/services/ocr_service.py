@@ -133,7 +133,9 @@ class OCRService:
                 continue
 
             conf = self._normalize_conf(self._safe_index(data.get("conf", []), idx, -1))
-            if 0 <= conf < 40:
+            # Keep medium-confidence tokens: receipts and small UI labels often
+            # have useful words below 40, especially after Telegram compression.
+            if 0 <= conf < 20:
                 continue
             if conf >= 0:
                 confidences.append(conf)
@@ -148,7 +150,7 @@ class OCRService:
 
         ordered_lines: list[str] = []
         for key in sorted(lines.keys()):
-            words = [word for _, word, conf in sorted(lines[key], key=lambda item: item[0]) if conf < 0 or conf >= 40]
+            words = [word for _, word, conf in sorted(lines[key], key=lambda item: item[0]) if conf < 0 or conf >= 20]
             line = " ".join(words).strip()
             if not line:
                 continue
@@ -158,11 +160,11 @@ class OCRService:
         if not text:
             return "", 0.0
 
-        # Prefer a useful, confidently recognized sparse-text result without
-        # allowing a few isolated high-confidence words to beat a fuller reading.
+        # Balance confidence with coverage so a fuller receipt or screenshot
+        # result can beat a few isolated high-confidence words.
         confidence = sum(confidences) / len(confidences) if confidences else 0.0
         word_count = sum(len(line.split()) for line in ordered_lines)
-        score = confidence + min(word_count, 12) * 1.5
+        score = confidence * 0.5 + min(word_count, 30) * 5
         return text, score
 
     def extract_text(self, path: str | Path) -> str | None:
@@ -179,6 +181,22 @@ class OCRService:
                 text, score = self._reconstruct_from_data(img, lang, psm)
                 if text:
                     candidates.append((score, text))
+                else:
+                    # Keep the plain-text path as a recall-oriented fallback for
+                    # layouts where Tesseract's confidence data is sparse or absent.
+                    try:
+                        fallback = pytesseract.image_to_string(
+                            img,
+                            lang=lang,
+                            config=f"--psm {psm} --oem 3",
+                            timeout=12,
+                        )
+                    except Exception:
+                        continue
+                    fallback = normalize_ocr_text(fallback)
+                    if fallback:
+                        word_count = len(fallback.split())
+                        candidates.append((25 + min(word_count, 30) * 5, fallback))
 
         if not candidates:
             return None
