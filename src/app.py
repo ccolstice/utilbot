@@ -77,7 +77,7 @@ from src.services.rss_service import RSSService
 from src.states.save_state import SaveStates
 from src.utils.search_parser import parse_search_request
 from src.utils.text_cleaner import safe_excerpt, normalize_multiline_input, normalize_ocr_text
-from src.utils.filters import WhitelistFilter, effective_allowed_user_ids, is_owner_user
+from src.utils.filters import WhitelistFilter, effective_allowed_user_ids, is_allowed_user, is_owner_user
 
 settings = get_settings()
 BOT_TOKEN = settings.bot_token
@@ -158,6 +158,40 @@ class SaveWordFilter(Filter):
 
 def _is_owner(user_id: int | None) -> bool:
     return user_id is not None and is_owner_user(int(user_id), settings)
+
+
+async def _cleanup_temporary_user_message(handler, event: Message, data: dict[str, Any]):
+    """Remove commands and conversational input after their handler has used them.
+
+    Saved content is handled by capture_incoming_message, which deletes the
+    source only after its archive copy is safely stored. This middleware is
+    limited to commands and active FSM input so a failed capture is preserved.
+    """
+    state = data.get("state")
+    state_before = await state.get_state() if state is not None else None
+    is_private_allowed = (
+        isinstance(event, Message)
+        and event.chat.type == "private"
+        and event.from_user is not None
+        and is_allowed_user(event.from_user.id, settings)
+    )
+    is_command = bool(event.text and event.text.lstrip().startswith("/"))
+
+    result = await handler(event, data)
+
+    if is_private_allowed and (is_command or state_before is not None):
+        try:
+            await event.delete()
+        except Exception:
+            logging.info(
+                "Could not remove temporary user message %s",
+                event.message_id,
+                exc_info=True,
+            )
+    return result
+
+
+dp.message.outer_middleware(_cleanup_temporary_user_message)
 
 
 def _paginate(items, page: int, page_size: int = PAGE_SIZE):
@@ -1675,6 +1709,8 @@ async def quick_tag_reply_handler(message: Message):
 
     item_id = int(match.group(1))
     item = VaultService.update_item_tags(message.from_user.id, item_id, tag_input)
+    with suppress(Exception):
+        await message.delete()
     if not item:
         await _send_text(message, "❌ Item не найден", reply_markup=main_menu_keyboard())
         return
