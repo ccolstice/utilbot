@@ -37,6 +37,7 @@ class MiniAppService:
         app.router.add_get("/miniapp/", self.serve_index)
         app.router.add_static("/miniapp/", str(MINI_APP_DIR), show_index=False)
         app.router.add_get("/api/miniapp/folders", self.list_folders)
+        app.router.add_post("/api/miniapp/folders", self.create_folder)
         app.router.add_get("/api/miniapp/items", self.list_items)
         app.router.add_post("/api/miniapp/items/bulk", self.bulk_action)
         app.router.add_get("/api/miniapp/items/{item_id:\\d+}/preview", self.photo_preview)
@@ -96,6 +97,44 @@ class MiniAppService:
             {"folders": [dict(row) for row in rows]},
             headers={"Cache-Control": "no-store"},
         )
+
+    async def create_folder(self, request: web.Request) -> web.Response:
+        user_id = self._authenticated_user_id(request)
+        try:
+            body = await request.json()
+        except (ValueError, json.JSONDecodeError):
+            raise web.HTTPBadRequest(text="Некорректный запрос.")
+        name = str(body.get("name") or "").strip()[:40] if isinstance(body, dict) else ""
+        if not name:
+            raise web.HTTPBadRequest(text="Введи название папки.")
+        conn = get_connection()
+        try:
+            exists = conn.execute(
+                "SELECT id FROM vault_folders WHERE user_id = ? AND name = ? COLLATE NOCASE",
+                (user_id, name),
+            ).fetchone()
+            if exists:
+                raise web.HTTPConflict(text="Папка с таким названием уже есть.")
+            cursor = conn.execute(
+                "INSERT INTO vault_folders (user_id, name, archived_at) VALUES (?, ?, NULL)",
+                (user_id, name),
+            )
+            conn.commit()
+            folder = conn.execute(
+                "SELECT id, name FROM vault_folders WHERE id = ? AND user_id = ?",
+                (cursor.lastrowid, user_id),
+            ).fetchone()
+        except web.HTTPException:
+            conn.rollback()
+            raise
+        except Exception:
+            conn.rollback()
+            logger.exception("Mini App folder creation failed for user %s", user_id)
+            raise web.HTTPInternalServerError(text="Не удалось создать папку.")
+        finally:
+            conn.close()
+        return web.json_response({"folder": {**dict(folder), "item_count": 0}}, status=201,
+                                 headers={"Cache-Control": "no-store"})
 
     async def list_items(self, request: web.Request) -> web.Response:
         user_id = self._authenticated_user_id(request)

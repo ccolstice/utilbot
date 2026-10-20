@@ -19,6 +19,7 @@
     return Number.isNaN(date.getTime()) ? "" : new Intl.DateTimeFormat("ru", { day: "numeric", month: "short" }).format(date);
   }
   function titleFor(item) {
+    if (item.kind === "text") return "Текстовая заметка";
     const source = item.content || item.page_title || item.file_name || ({ photo: "Фото", document: "Файл", video: "Видео", voice: "Голосовое", audio: "Аудио", sticker: "Стикер", animation: "GIF", video_note: "Видеосообщение", link: "Ссылка" }[item.kind] || "Текст");
     const cleaned = String(source).replace(/https?:\/\/\S+/g, (url) => url).trim();
     return cleaned || "Материал";
@@ -34,7 +35,11 @@
     const response = await fetch(path, { ...options, headers: { ...apiHeaders, ...(options.headers || {}) } });
     if (!response.ok) {
       let message = "Не удалось выполнить запрос.";
-      try { const data = await response.json(); message = data.message || data.error || data.detail || message; } catch { try { message = await response.text() || message; } catch {} }
+      try {
+        const body = await response.text();
+        try { const data = JSON.parse(body); message = data.message || data.error || data.detail || body || message; }
+        catch { message = body || message; }
+      } catch {}
       throw new Error(message);
     }
     return response.json();
@@ -48,6 +53,7 @@
     const current = select.value;
     select.innerHTML = '<option value="">Все папки</option>' + state.folders.map((folder) => `<option value="${folder.id}">${escapeHtml(folder.name)} (${folder.item_count})</option>`).join("");
     select.value = current;
+    $("folder-drop-targets").innerHTML = state.folders.map((folder) => `<button class="folder-drop-target" type="button" data-folder-id="${folder.id}">📁 ${escapeHtml(folder.name)}</button>`).join("");
   }
   function filters() {
     return new URLSearchParams({
@@ -88,19 +94,24 @@
       const selected = state.selected.has(item.id);
       const tags = tagsOf(item).map((tag) => `<span class="tag-pill">#${escapeHtml(tag)}</span>`).join("");
       const title = titleFor(item);
+      const isText = item.kind === "text";
       const preview = item.preview_url
         ? `<div class="item-preview"><img data-preview="${item.id}" alt="Превью материала" loading="lazy"></div>`
-        : `<div class="item-preview"><span class="preview-placeholder">${kindIcon(item.kind)}</span></div>`;
-      return `<article class="item-card${selected ? " selected" : ""}" data-id="${item.id}" tabindex="0" role="button" aria-label="${escapeHtml(title)}">
+        : isText ? "" : `<div class="item-preview"><span class="preview-placeholder">${kindIcon(item.kind)}</span></div>`;
+      const textExcerpt = isText ? `<div class="text-excerpt">${escapeHtml((item.content || "Текстовая запись").trim())}</div>` : "";
+      return `<article class="item-card${isText ? " text-card" : ""}${selected ? " selected" : ""}" data-id="${item.id}" tabindex="0" role="button" aria-label="${escapeHtml(title)}">
         <span class="selection-check" aria-hidden="true">${selected ? "✓" : ""}</span>
         ${item.is_favorite ? '<span class="favorite-mark" aria-label="В избранном">⭐</span>' : ""}
         ${preview}<div class="card-body"><div class="card-title">${escapeHtml(title)}</div>
+        ${textExcerpt}
         <div class="card-meta"><span class="card-folder">📁 ${escapeHtml(item.folder_name)}</span><time>${escapeHtml(displayDate(item.created_at))}</time></div>
         ${tags ? `<div class="tag-list">${tags}</div>` : ""}</div></article>`;
     }).join("");
     grid.querySelectorAll(".item-card").forEach((card) => {
       card.addEventListener("click", () => onCardClick(Number(card.dataset.id)));
+      card.addEventListener("contextmenu", (event) => { event.preventDefault(); openDetails(Number(card.dataset.id)); });
       card.addEventListener("keydown", (event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); onCardClick(Number(card.dataset.id)); } });
+      enableLongPressMove(card);
     });
     observePhotos();
   }
@@ -150,14 +161,21 @@
       <div class="detail-meta">📁 ${escapeHtml(item.folder_name)} · ${escapeHtml(stateLabels[item.item_state] || item.item_state)} · ${escapeHtml(displayDate(item.created_at))}${item.sender_name ? ` · ${escapeHtml(item.sender_name)}` : ""}</div>
       ${tags ? `<div class="tag-list detail-tags">${tags}</div>` : ""}
       ${text ? `<div class="detail-text">${escapeHtml(text)}</div>` : ""}
-      ${item.context_text ? `<h3>Контекст</h3><div class="detail-text">${escapeHtml(item.context_text)}</div>` : ""}`;
+      ${item.context_text ? `<h3>Контекст</h3><div class="detail-text">${escapeHtml(item.context_text)}</div>` : ""}
+      <div class="detail-actions">
+        <button type="button" data-item-action="move">📁 Переместить</button><button type="button" data-item-action="tag">🏷 Тег</button>
+        <button type="button" data-item-action="state">↔ Статус</button><button type="button" data-item-action="favorite">⭐ ${item.is_favorite ? "Убрать из избранного" : "В избранное"}</button>
+        <button type="button" class="danger-action" data-item-action="delete">🗑 Удалить</button>
+      </div>`;
     $("detail-dialog").showModal();
     const image = $("detail-content").querySelector("img[data-preview]"); if (image) fetchPhoto(image);
+    $("detail-content").querySelectorAll("[data-item-action]").forEach((button) => button.addEventListener("click", () => showAction(button.dataset.itemAction, [item.id], !item.is_favorite)));
   }
 
-  function showAction(action) {
-    if (!state.selected.size) return;
-    const count = state.selected.size;
+  function showAction(action, overrideIds = null, favoriteValue = null) {
+    const itemIds = overrideIds || [...state.selected];
+    if (!itemIds.length) return;
+    const count = itemIds.length;
     const title = { move: "Переместить материалы", tag: "Изменить теги", state: "Изменить статус", favorite: "Избранное", delete: "Удалить материалы" }[action];
     $("action-title").textContent = `${title} · ${count}`;
     const folderOptions = state.folders.map((folder) => `<option value="${folder.id}">${escapeHtml(folder.name)}</option>`).join("");
@@ -166,7 +184,7 @@
     if (action === "move") form = `<label>Новая папка<select name="folder_id">${folderOptions}</select></label>`;
     if (action === "tag") form = `<label>Тег<input name="tag" maxlength="64" placeholder="например, прочитать" required></label><label>Как применить<select name="mode"><option value="add">Добавить к существующим</option><option value="replace">Заменить все теги</option></select></label>`;
     if (action === "state") form = `<label>Новый статус<select name="state">${stateOptions}</select></label>`;
-    if (action === "favorite") form = `<label>Действие<select name="favorite"><option value="1">Добавить в избранное</option><option value="0">Убрать из избранного</option></select></label>`;
+    if (action === "favorite") form = `<label>Действие<select name="favorite"><option value="1" ${favoriteValue === true ? "selected" : ""}>Добавить в избранное</option><option value="0" ${favoriteValue === false ? "selected" : ""}>Убрать из избранного</option></select></label>`;
     if (action === "delete") form = `<p class="action-note">Записи удалятся из каталога, бот также попробует удалить их копии и контекст из чата. Telegram может запретить удаление старых сообщений.</p><p class="action-note">Это действие нельзя отменить.</p>`;
     const destructive = action === "delete";
     form += `<div class="form-actions"><button type="button" class="secondary" data-cancel>Отмена</button><button type="submit" class="${destructive ? "danger" : ""}">${destructive ? "Удалить" : "Применить"}</button></div>`;
@@ -178,7 +196,7 @@
       event.preventDefault();
       const button = formNode.querySelector('[type="submit"]'); button.disabled = true;
       const values = Object.fromEntries(new FormData(formNode).entries());
-      const payload = { action, ids: [...state.selected] };
+      const payload = { action, ids: itemIds };
       if (action === "move") payload.folder_id = Number(values.folder_id);
       if (action === "tag") { payload.tag = values.tag; payload.mode = values.mode; }
       if (action === "state") payload.state = values.state;
@@ -187,10 +205,66 @@
         const result = await api("/api/miniapp/items/bulk", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
         const leftInChat = action === "delete" ? result.telegram_messages_total - result.telegram_messages_removed : 0;
         const copiesNote = leftInChat > 0 ? `; ${leftInChat} старых сообщений могли остаться в чате` : "";
-        $("action-dialog").close(); state.selected.clear(); state.selectMode = false; state.page = 1; toast(`Обновлено: ${result.updated}${copiesNote}`); await loadItems();
+        $("action-dialog").close();
+        if (overrideIds) $("detail-dialog").close();
+        state.selected.clear(); state.selectMode = false; state.page = 1; updateSelectionBar(); toast(`Обновлено: ${result.updated}${copiesNote}`); await loadFolders(); await loadItems();
       } catch (error) { button.disabled = false; showError(error.message); $("action-dialog").close(); }
     });
   }
+
+  async function moveOneToFolder(itemId, folderId) {
+    try {
+      await api("/api/miniapp/items/bulk", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ action: "move", ids: [itemId], folder_id: folderId }) });
+      $("folder-drop-zone").hidden = true; toast("Материал перемещён в папку"); await loadFolders(); await loadItems();
+    } catch (error) { $("folder-drop-zone").hidden = true; showError(error.message); }
+  }
+  let activeDrag = null;
+  function clearActiveDrag() {
+    if (!activeDrag) return;
+    clearTimeout(activeDrag.timer); activeDrag.card.classList.remove("dragging"); activeDrag.ghost?.remove();
+    $("folder-drop-zone").hidden = true;
+    $("folder-drop-targets").querySelectorAll(".drop-hover").forEach((node) => node.classList.remove("drop-hover"));
+    activeDrag = null;
+  }
+  function enableLongPressMove(card) {
+    card.addEventListener("click", (event) => {
+      if (!card.dataset.suppressClick) return;
+      delete card.dataset.suppressClick; event.preventDefault(); event.stopImmediatePropagation();
+    }, true);
+    card.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0 || state.selectMode || state.selected.size) return;
+      clearActiveDrag();
+      const drag = activeDrag = { card, pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, dragging: false, ghost: null };
+      drag.timer = setTimeout(() => {
+        if (activeDrag !== drag) return;
+        drag.dragging = true; $("folder-drop-zone").hidden = false; card.classList.add("dragging");
+        drag.ghost = card.cloneNode(true); drag.ghost.classList.add("drag-ghost"); document.body.appendChild(drag.ghost);
+        tg?.HapticFeedback?.impactOccurred?.("light");
+      }, 420);
+    });
+    card.addEventListener("pointercancel", clearActiveDrag);
+  }
+  document.addEventListener("pointermove", (event) => {
+    const drag = activeDrag;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    if (!drag.dragging && Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) > 12) { clearTimeout(drag.timer); drag.timer = null; return; }
+    if (!drag.dragging) return;
+    if (event.cancelable) event.preventDefault();
+    if (drag.ghost) { drag.ghost.style.left = `${event.clientX + 14}px`; drag.ghost.style.top = `${event.clientY + 14}px`; }
+    const targets = $("folder-drop-targets");
+    targets.querySelectorAll(".drop-hover").forEach((node) => node.classList.remove("drop-hover"));
+    document.elementFromPoint(event.clientX, event.clientY)?.closest(".folder-drop-target")?.classList.add("drop-hover");
+  }, { passive: false });
+  document.addEventListener("pointerup", (event) => {
+    const drag = activeDrag;
+    if (!drag || drag.pointerId !== event.pointerId) return;
+    const folder = drag.dragging ? document.elementFromPoint(event.clientX, event.clientY)?.closest(".folder-drop-target") : null;
+    const folderId = folder ? Number(folder.dataset.folderId) : null;
+    if (drag.dragging) drag.card.dataset.suppressClick = "1";
+    const itemId = Number(drag.card.dataset.id);
+    clearActiveDrag();
+    if (folderId) moveOneToFolder(itemId, folderId);
+  });
 
   $("select-mode").addEventListener("click", () => {
     state.selectMode = !state.selectMode;
@@ -198,6 +272,19 @@
   });
   $("clear-selection").addEventListener("click", () => { state.selected.clear(); state.selectMode = false; renderItems(state.currentItems); updateSelectionBar(); });
   $("selection-bar").addEventListener("click", (event) => { const button = event.target.closest("button[data-action]"); if (button) showAction(button.dataset.action); });
+  $("folder-drop-targets").addEventListener("click", (event) => {
+    const target = event.target.closest(".folder-drop-target");
+    if (target) { $("folder-filter").value = target.dataset.folderId; $("folder-drop-zone").hidden = true; filtersChanged(); }
+  });
+  $("create-folder").addEventListener("click", () => { $("folder-dialog").showModal(); $("folder-form").elements.name.focus(); });
+  $("folder-form").querySelector("[data-cancel]").addEventListener("click", () => $("folder-dialog").close());
+  $("folder-form").addEventListener("submit", async (event) => {
+    event.preventDefault(); const form = event.currentTarget; const button = form.querySelector('[type="submit"]'); button.disabled = true;
+    try {
+      const result = await api("/api/miniapp/folders", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: new FormData(form).get("name") }) });
+      $("folder-dialog").close(); form.reset(); await loadFolders(); $("folder-filter").value = String(result.folder.id); filtersChanged(); toast("Папка создана");
+    } catch (error) { showError(error.message); } finally { button.disabled = false; }
+  });
   $("previous-page").addEventListener("click", () => { if (state.page > 1) { state.page--; loadItems(); window.scrollTo({ top: 0, behavior: "smooth" }); } });
   $("next-page").addEventListener("click", () => { if (state.page * state.pageSize < state.total) { state.page++; loadItems(); window.scrollTo({ top: 0, behavior: "smooth" }); } });
   function filtersChanged() {

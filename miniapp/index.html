@@ -5,9 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
     <meta name="theme-color" content="#101923">
     <title>Архив</title>
-    <link rel="stylesheet" href="/miniapp/styles.css?v=1">
+    <link rel="stylesheet" href="/miniapp/styles.css?v=2">
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
-    <script src="/miniapp/app.js?v=1" defer></script>
+    <script src="/miniapp/app.js?v=2" defer></script>
   </head>
   <body>
     <main class="app-shell">
@@ -29,7 +29,7 @@
           <button id="clear-search" class="clear-search" type="button" aria-label="Очистить поиск">×</button>
         </label>
         <div class="filters-row">
-          <select id="folder-filter" aria-label="Папка"><option value="">Все папки</option></select>
+          <div class="folder-filter-row"><select id="folder-filter" aria-label="Папка"><option value="">Все папки</option></select><button id="create-folder" class="quiet-button" type="button">＋ Папка</button></div>
           <select id="kind-filter" aria-label="Тип материала">
             <option value="all">Все типы</option>
             <option value="photo">Фото</option><option value="text">Текст</option>
@@ -47,6 +47,10 @@
           <label class="tag-filter"><span>#</span><input id="tag-filter" type="text" placeholder="Фильтр по тегу"></label>
           <button id="favorites-filter" class="chip-button" type="button" aria-pressed="false">☆ Избранное</button>
         </div>
+      </section>
+
+      <section id="folder-drop-zone" class="folder-drop-zone" aria-label="Переместить в папку" hidden>
+        <span class="drop-zone-hint">Перетащи материал в папку</span><div id="folder-drop-targets" class="folder-drop-targets"></div>
       </section>
 
       <div id="error-banner" class="error-banner" hidden></div>
@@ -83,6 +87,14 @@
       <form method="dialog" class="sheet-close-row"><button class="close-button" aria-label="Закрыть">×</button></form>
       <h2 id="action-title">Действие с материалами</h2>
       <div id="action-form"></div>
+    </dialog>
+    <dialog id="folder-dialog" class="sheet action-sheet">
+      <form method="dialog" class="sheet-close-row"><button class="close-button" aria-label="Закрыть">×</button></form>
+      <h2>Новая папка</h2>
+      <form id="folder-form" class="action-form">
+        <label>Название<input name="name" maxlength="40" placeholder="Например, Идеи" required></label>
+        <div class="form-actions"><button type="button" class="secondary" data-cancel>Отмена</button><button type="submit">Создать</button></div>
+      </form>
     </dialog>
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
   </body>
