@@ -1,29 +1,46 @@
 from __future__ import annotations
 
+import os
+
 from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    WebAppInfo,
 )
 
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
+    web_app_url = os.getenv("MINI_APP_URL", "").strip()
+    if not web_app_url:
+        render_url = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
+        if render_url.startswith("https://"):
+            web_app_url = f"{render_url}/miniapp/"
+
+    keyboard = [
+        [
+            InlineKeyboardButton(text="📥 Входящие", callback_data="menu:inbox"),
+            InlineKeyboardButton(text="🔎 Поиск", callback_data="menu:search"),
+        ],
+        [
+            InlineKeyboardButton(text="⏳ На потом", callback_data="menu:later"),
+            InlineKeyboardButton(text="⭐ Избранное", callback_data="menu:favorites"),
+        ],
+        [
+            InlineKeyboardButton(text="📁 Папки", callback_data="menu:vault"),
+            InlineKeyboardButton(text="⏰ Напоминания", callback_data="menu:reminders"),
+        ],
+        [InlineKeyboardButton(text="🎲 Случайная находка", callback_data="menu:random")],
+    ]
+    if web_app_url.startswith("https://"):
+        keyboard.append([
+            InlineKeyboardButton(
+                text="🗃 Открыть архив",
+                web_app=WebAppInfo(url=web_app_url),
+            )
+        ])
+    keyboard.append([InlineKeyboardButton(text="⚙️ Ещё", callback_data="menu:more")])
     return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="📥 Входящие", callback_data="menu:inbox"),
-                InlineKeyboardButton(text="🔎 Поиск", callback_data="menu:search"),
-            ],
-            [
-                InlineKeyboardButton(text="⏳ На потом", callback_data="menu:later"),
-                InlineKeyboardButton(text="⭐ Избранное", callback_data="menu:favorites"),
-            ],
-            [
-                InlineKeyboardButton(text="📁 Папки", callback_data="menu:vault"),
-                InlineKeyboardButton(text="⏰ Напоминания", callback_data="menu:reminders"),
-            ],
-            [InlineKeyboardButton(text="🎲 Случайная находка", callback_data="menu:random")],
-            [InlineKeyboardButton(text="⚙️ Ещё", callback_data="menu:more")],
-        ]
+        inline_keyboard=keyboard
     )
 
 

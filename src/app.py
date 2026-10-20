@@ -2932,7 +2932,7 @@ async def main():
     except Exception:
         logging.exception("Could not configure Telegram command menu")
 
-    health_server = HealthServer(host=settings.host, port=settings.port)
+    health_server = HealthServer(host=settings.host, port=settings.port, bot=bot, settings=settings)
     await health_server.start()
 
     reminder_task = asyncio.create_task(reminder_worker(bot))
