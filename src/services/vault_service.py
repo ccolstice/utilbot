@@ -5,6 +5,7 @@ from typing import Iterable
 
 from src.db.database import get_connection
 from src.services.tag_service import build_auto_tags, format_tags, merge_user_tags
+from src.utils.folder_emojis import random_folder_emoji
 
 
 class VaultService:
@@ -23,10 +24,10 @@ class VaultService:
         conn = get_connection()
         conn.execute(
             """
-            INSERT OR IGNORE INTO vault_folders (user_id, name, archived_at)
-            VALUES (?, ?, NULL)
+            INSERT OR IGNORE INTO vault_folders (user_id, name, archived_at, emoji)
+            VALUES (?, ?, NULL, ?)
             """,
-            (user_id, name),
+            (user_id, name, random_folder_emoji()),
         )
         conn.commit()
         row = conn.execute(
@@ -45,8 +46,8 @@ class VaultService:
         conn = get_connection()
         conn.execute(
             """
-            INSERT OR IGNORE INTO vault_folders (user_id, name, archived_at)
-            VALUES (?, ?, NULL)
+            INSERT OR IGNORE INTO vault_folders (user_id, name, archived_at, emoji)
+            VALUES (?, ?, NULL, '📥')
             """,
             (user_id, VaultService.DEFAULT_FOLDER_NAME),
         )

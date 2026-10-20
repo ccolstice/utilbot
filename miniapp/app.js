@@ -51,9 +51,9 @@
     const data = await api("/api/miniapp/folders"); state.folders = data.folders;
     const select = $("folder-filter");
     const current = select.value;
-    select.innerHTML = '<option value="">Все папки</option>' + state.folders.map((folder) => `<option value="${folder.id}">${escapeHtml(folder.name)} (${folder.item_count})</option>`).join("");
+    select.innerHTML = '<option value="">Все папки</option>' + state.folders.map((folder) => `<option value="${folder.id}">${escapeHtml(folder.emoji || "📁")} ${escapeHtml(folder.name)} (${folder.item_count})</option>`).join("");
     select.value = current;
-    $("folder-drop-targets").innerHTML = state.folders.map((folder) => `<button class="folder-drop-target" type="button" data-folder-id="${folder.id}">📁 ${escapeHtml(folder.name)}</button>`).join("");
+    $("folder-drop-targets").innerHTML = state.folders.map((folder) => `<button class="folder-drop-target" type="button" data-folder-id="${folder.id}">${escapeHtml(folder.emoji || "📁")} ${escapeHtml(folder.name)}</button>`).join("");
   }
   function filters() {
     return new URLSearchParams({
@@ -104,7 +104,7 @@
         ${item.is_favorite ? '<span class="favorite-mark" aria-label="В избранном">⭐</span>' : ""}
         ${preview}<div class="card-body"><div class="card-title">${escapeHtml(title)}</div>
         ${textExcerpt}
-        <div class="card-meta"><span class="card-folder">📁 ${escapeHtml(item.folder_name)}</span><time>${escapeHtml(displayDate(item.created_at))}</time></div>
+        <div class="card-meta"><span class="card-folder">${escapeHtml(item.folder_emoji || "📁")} ${escapeHtml(item.folder_name)}</span><time>${escapeHtml(displayDate(item.created_at))}</time></div>
         ${tags ? `<div class="tag-list">${tags}</div>` : ""}</div></article>`;
     }).join("");
     grid.querySelectorAll(".item-card").forEach((card) => {
@@ -158,7 +158,7 @@
     const media = item.preview_url ? `<img class="detail-image" data-preview="${item.id}" alt="Фото">` : "";
     const text = item.content || item.link_url || item.file_name || "";
     $("detail-content").innerHTML = `${media}<h2 class="detail-title">${escapeHtml(titleFor(item))}</h2>
-      <div class="detail-meta">📁 ${escapeHtml(item.folder_name)} · ${escapeHtml(stateLabels[item.item_state] || item.item_state)} · ${escapeHtml(displayDate(item.created_at))}${item.sender_name ? ` · ${escapeHtml(item.sender_name)}` : ""}</div>
+      <div class="detail-meta">${escapeHtml(item.folder_emoji || "📁")} ${escapeHtml(item.folder_name)} · ${escapeHtml(stateLabels[item.item_state] || item.item_state)} · ${escapeHtml(displayDate(item.created_at))}${item.sender_name ? ` · ${escapeHtml(item.sender_name)}` : ""}</div>
       ${tags ? `<div class="tag-list detail-tags">${tags}</div>` : ""}
       ${text ? `<div class="detail-text">${escapeHtml(text)}</div>` : ""}
       ${item.context_text ? `<h3>Контекст</h3><div class="detail-text">${escapeHtml(item.context_text)}</div>` : ""}
@@ -247,7 +247,7 @@
   document.addEventListener("pointermove", (event) => {
     const drag = activeDrag;
     if (!drag || drag.pointerId !== event.pointerId) return;
-    if (!drag.dragging && Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) > 12) { clearTimeout(drag.timer); drag.timer = null; return; }
+    if (!drag.dragging && Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) > 18) { clearTimeout(drag.timer); drag.timer = null; return; }
     if (!drag.dragging) return;
     if (event.cancelable) event.preventDefault();
     if (drag.ghost) { drag.ghost.style.left = `${event.clientX + 14}px`; drag.ghost.style.top = `${event.clientY + 14}px`; }

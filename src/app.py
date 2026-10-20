@@ -977,7 +977,7 @@ async def show_folder_items_page(
 
     rows = VaultService.list_items(user_id=user_id, folder_id=folder_id, include_archived=True)
     if not rows:
-        text = f"📂 {folder['name']}\n\n📭 Папка пуста"
+        text = f"{folder['emoji'] or '📁'} {folder['name']}\n\n📭 Папка пуста"
         markup = back_keyboard(f"vault_folders_page_{folders_page}")
         if edit:
             await _edit_text_or_send(target, text, reply_markup=markup)
@@ -986,7 +986,7 @@ async def show_folder_items_page(
         return
 
     page_rows, total_pages, page, start = _paginate(rows, page)
-    text = f"📂 {folder['name']}\nСтраница {page}/{total_pages}\n\n"
+    text = f"{folder['emoji'] or '📁'} {folder['name']}\nСтраница {page}/{total_pages}\n\n"
 
     visible_index = start + 1
     for row in page_rows:
@@ -1021,7 +1021,7 @@ async def show_all_files_page(target, user_id: int, page: int, *, edit: bool = F
         return
 
     folders = VaultService.list_folders(user_id, include_archived=True)
-    folder_map = {folder["id"]: folder["name"] for folder in folders}
+    folder_map = {folder["id"]: f"{folder['emoji'] or '📁'} {folder['name']}" for folder in folders}
 
     page_rows, total_pages, page, start = _paginate(rows, page)
     text = f"🗂 Все файлы\nСтраница {page}/{total_pages}\n\n"
@@ -1033,7 +1033,7 @@ async def show_all_files_page(target, user_id: int, page: int, *, edit: bool = F
         folder_name = folder_map.get(row["folder_id"], "Без папки")
         text += (
             f"#{visible_index} {_preview_row(row)}\n"
-            f"📁 {folder_name} • 👤 {sender} • {dt}\n\n"
+            f"{folder_name} • 👤 {sender} • {dt}\n\n"
         )
         visible_index += 1
 
@@ -1066,7 +1066,7 @@ async def show_search_results_page(target, session_id: str, page: int, *, edit: 
 
     visible_index = start + 1
     folders = VaultService.list_folders(session["user_id"], include_archived=True)
-    folder_map = {folder["id"]: folder["name"] for folder in folders}
+    folder_map = {folder["id"]: f"{folder['emoji'] or '📁'} {folder['name']}" for folder in folders}
 
     for row in page_rows:
         sender = row["sender_name"] or "Unknown"
@@ -1074,7 +1074,7 @@ async def show_search_results_page(target, session_id: str, page: int, *, edit: 
         folder_name = folder_map.get(row["folder_id"], "Без папки")
         text += (
             f"#{visible_index} {_preview_row(row)}\n"
-            f"📁 {folder_name} • 👤 {sender} • {dt}\n\n"
+            f"{folder_name} • 👤 {sender} • {dt}\n\n"
         )
         visible_index += 1
 
@@ -1108,7 +1108,7 @@ async def show_item_view(
         return
 
     folder = VaultService.get_folder_by_id(user_id=user_id, folder_id=row["folder_id"])
-    folder_name = folder["name"] if folder else "Без папки"
+    folder_name = f"{folder['emoji'] or '📁'} {folder['name']}" if folder else "Без папки"
     sender = row["sender_name"] or "Unknown"
     dt = _format_dt(row["created_at"])
     tag = row["tag"] or "—"
@@ -1182,7 +1182,7 @@ async def show_item_view(
     }
     content = row["content"] or ""
     header = (
-        f"📂 {folder_name}\n👤 {sender}\n🕒 {dt}\n🏷 {tag}\n"
+        f"{folder_name}\n👤 {sender}\n🕒 {dt}\n🏷 {tag}\n"
         f"#{item_id} · {kind_labels.get(row['kind'], row['kind'].title())}"
     )
     if origin == "review":
@@ -2476,7 +2476,7 @@ async def folder_manage_handler(callback: CallbackQuery):
         return
 
     text = (
-        f"⚙️ Папка: {folder['name']}\n"
+        f"⚙️ Папка: {folder['emoji'] or '📁'} {folder['name']}\n"
         f"ID: {folder['id']}\n"
         f"Статус: {'архив' if folder['archived_at'] else 'активна'}"
     )

@@ -40,7 +40,7 @@ select { min-width: 0; color: var(--text); background: var(--bg); border: 1px so
 .chip-button { padding: 9px 11px; white-space: nowrap; }
 .chip-button[aria-pressed="true"] { color: var(--accent-text); background: var(--accent); border-color: transparent; }
 .item-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
-.item-card { position: relative; min-width: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 16px; background: var(--surface); cursor: pointer; transition: border-color .14s, transform .14s; }
+.item-card { position: relative; min-width: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 16px; background: var(--surface); cursor: pointer; transition: border-color .14s, transform .14s; user-select: none; -webkit-user-select: none; touch-action: pan-y; }
 .item-card:active { transform: scale(.985); }
 .item-card.dragging { opacity: .38; }
 .item-card.text-card { display: flex; min-height: 160px; }

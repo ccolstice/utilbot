@@ -4,6 +4,8 @@ import os
 import sqlite3
 from pathlib import Path
 
+from src.utils.folder_emojis import random_folder_emoji
+
 DATABASE_FILE = Path(os.getenv("DATABASE_PATH", "data/bot.sqlite3"))
 DATABASE_FILE.parent.mkdir(parents=True, exist_ok=True)
 
@@ -157,6 +159,9 @@ def init_db():
     """)
 
     _ensure_column(conn, "vault_folders", "archived_at TIMESTAMP DEFAULT NULL")
+    _ensure_column(conn, "vault_folders", "emoji TEXT")
+    for row in conn.execute("SELECT id FROM vault_folders WHERE emoji IS NULL OR TRIM(emoji) = ''").fetchall():
+        conn.execute("UPDATE vault_folders SET emoji = ? WHERE id = ?", (random_folder_emoji(), row["id"]))
     _ensure_column(conn, "vault_items", "tag TEXT")
     _ensure_column(conn, "vault_items", "telegram_file_id TEXT")
     _ensure_column(conn, "vault_items", "archive_chat_id INTEGER")

@@ -14,6 +14,7 @@ from aiohttp import web
 from src.config import Settings
 from src.db.database import get_connection
 from src.services.tag_service import format_tags, merge_user_tags
+from src.services.vault_service import VaultService
 from src.utils.filters import is_allowed_user
 
 logger = logging.getLogger(__name__)
@@ -84,7 +85,7 @@ class MiniAppService:
         conn = get_connection()
         try:
             rows = conn.execute(
-                """SELECT f.id, f.name, COUNT(i.id) AS item_count
+                """SELECT f.id, f.name, f.emoji, COUNT(i.id) AS item_count
                    FROM vault_folders f
                    LEFT JOIN vault_items i ON i.folder_id = f.id AND i.user_id = f.user_id
                    WHERE f.user_id = ? AND f.archived_at IS NULL
@@ -107,32 +108,21 @@ class MiniAppService:
         name = str(body.get("name") or "").strip()[:40] if isinstance(body, dict) else ""
         if not name:
             raise web.HTTPBadRequest(text="Введи название папки.")
-        conn = get_connection()
         try:
-            exists = conn.execute(
-                "SELECT id FROM vault_folders WHERE user_id = ? AND name = ? COLLATE NOCASE",
-                (user_id, name),
-            ).fetchone()
+            exists = next((folder for folder in VaultService.list_folders(user_id, include_archived=True)
+                           if folder["name"].casefold() == name.casefold()), None)
             if exists:
                 raise web.HTTPConflict(text="Папка с таким названием уже есть.")
-            cursor = conn.execute(
-                "INSERT INTO vault_folders (user_id, name, archived_at) VALUES (?, ?, NULL)",
-                (user_id, name),
-            )
-            conn.commit()
-            folder = conn.execute(
-                "SELECT id, name FROM vault_folders WHERE id = ? AND user_id = ?",
-                (cursor.lastrowid, user_id),
-            ).fetchone()
         except web.HTTPException:
-            conn.rollback()
             raise
         except Exception:
-            conn.rollback()
             logger.exception("Mini App folder creation failed for user %s", user_id)
             raise web.HTTPInternalServerError(text="Не удалось создать папку.")
-        finally:
-            conn.close()
+        try:
+            folder = VaultService.create_folder(user_id, name)
+        except Exception:
+            logger.exception("Mini App folder creation failed for user %s", user_id)
+            raise web.HTTPInternalServerError(text="Не удалось создать папку.")
         return web.json_response({"folder": {**dict(folder), "item_count": 0}}, status=201,
                                  headers={"Cache-Control": "no-store"})
 
@@ -204,7 +194,7 @@ class MiniAppService:
                 f"""SELECT i.id, i.kind, i.content, i.tag, i.manual_tag, i.file_name,
                            i.file_size, i.media_type, i.sender_name, i.created_at,
                            i.item_state, i.is_favorite, i.context_text, i.telegram_file_id,
-                           i.link_url, i.page_title, f.name AS folder_name
+                           i.link_url, i.page_title, f.name AS folder_name, f.emoji AS folder_emoji
                     FROM vault_items i JOIN vault_folders f ON f.id = i.folder_id
                     WHERE {where}
                     ORDER BY i.id DESC LIMIT ? OFFSET ?""",

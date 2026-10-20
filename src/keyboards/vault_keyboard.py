@@ -155,7 +155,7 @@ def folders_keyboard(
         keyboard.append(
             [
                 InlineKeyboardButton(
-                    text=f"📁 {folder['name']}",
+                    text=f"{folder['emoji'] or '📁'} {folder['name']}",
                     callback_data=cb,
                 )
             ]
