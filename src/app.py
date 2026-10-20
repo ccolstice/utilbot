@@ -1521,10 +1521,15 @@ async def status_command_handler(message: Message):
         "📊 Статус бота\n\n"
         f"• Health server: {'on' if health else 'off'}\n"
         f"• Каталог: {item_count} материалов\n"
+        f"• База: {DATABASE_FILE}\n"
         f"• Backup recipients: {len(backup_recipients)}\n"
         f"• Автобэкап: раз в {settings.backup_interval_hours} ч.\n"
         f"• Последний бэкап: {last_backup}"
     )
+    if settings.render_free_mode:
+        text += "\n\n⚠️ Render Free удаляет локальную базу при redeploy/restart. Для постоянного хранения нужен Persistent Disk на платном плане."
+    if not backup_recipients:
+        text += "\n\n❌ Автобэкап выключен: укажи свой Telegram ID в OWNER_USER_IDS или ALLOWED_USER_IDS в Render."
     if item_count == 0:
         text += "\n\nЕсли архив раньше был непустым, ответь командой /restore на последнее сообщение с резервной копией."
     await render_menu_panel(message, text, reply_markup=main_menu_keyboard())
