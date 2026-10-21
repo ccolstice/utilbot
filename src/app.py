@@ -67,6 +67,7 @@ from src.handlers.reminders import router as reminders_router, show_reminders_pa
 from src.handlers.knowledge import router as knowledge_router, _show_favorites_page
 from src.services.reminder_service import reminder_worker
 from src.services.backup_service import BackupService, backup_worker
+from src.services.google_drive_service import GoogleDriveService
 from src.services.health_server import HealthServer
 from src.services.index_service import IndexService
 from src.services.media_service import MediaService
@@ -1508,6 +1509,8 @@ async def help_handler(message: Message):
         "Папки создаются из раздела «Папки». RSS находится в «Ещё».\n\n"
         "/backup — создать снимок базы в этом чате.\n"
         "/restore — ответить этой командой на сообщение со снимком.\n"
+        "/drive_backup — сохранить снимок базы в Google Drive.\n"
+        "/drive_backups — список копий Drive и восстановление.\n"
         "/status — проверить состояние и дату последнего снимка.",
         reply_markup=main_menu_keyboard(),
     )
@@ -1594,6 +1597,128 @@ async def restore_command_handler(message: Message):
     except Exception as exc:
         logging.exception("Database restore failed")
         await _send_text(message, f"❌ Не удалось восстановить базу: {exc}")
+    finally:
+        restore_path.unlink(missing_ok=True)
+
+
+async def _upload_drive_database_snapshot() -> dict:
+    if not BackupService.has_user_data():
+        raise RuntimeError("Текущая база пустая — пустой снимок не загружаю.")
+    path = BackupService.create_snapshot(prefix="utilbot-db")
+    try:
+        count_db = sqlite3.connect(str(path))
+        try:
+            item_count = int(count_db.execute("SELECT COUNT(*) FROM vault_items").fetchone()[0])
+        finally:
+            count_db.close()
+        return await GoogleDriveService.upload_snapshot(path, item_count=item_count)
+    finally:
+        path.unlink(missing_ok=True)
+
+
+@dp.message(Command("drive_backup"))
+async def drive_backup_command_handler(message: Message):
+    if not _is_owner(message.from_user.id if message.from_user else None):
+        await _send_text(message, "⛔ Выгрузка в Google Drive доступна только владельцу.")
+        return
+    if not GoogleDriveService.configured():
+        await _send_text(message, "Google Drive ещё не настроен. Сначала добавь адрес Apps Script и общий ключ в Render.")
+        return
+    await render_menu_panel(message, "☁️ Готовлю копию базы и загружаю её в Google Drive…", reply_markup=main_menu_keyboard())
+    try:
+        uploaded = await _upload_drive_database_snapshot()
+        await render_menu_panel(
+            message,
+            f"✅ Копия базы сохранена в Google Drive.\n\nФайл: {uploaded.get('name', 'utilbot backup')}\nРазмер: {uploaded.get('size', '—')} байт",
+            reply_markup=main_menu_keyboard(),
+        )
+    except Exception as exc:
+        logging.exception("Google Drive backup failed")
+        await render_menu_panel(message, f"❌ Не удалось сохранить копию в Google Drive: {str(exc)[:700]}", reply_markup=main_menu_keyboard())
+
+
+@dp.message(Command("drive_backups"))
+async def drive_backups_command_handler(message: Message):
+    if not _is_owner(message.from_user.id if message.from_user else None):
+        await _send_text(message, "⛔ Просмотр копий доступен только владельцу.")
+        return
+    if not GoogleDriveService.configured():
+        await _send_text(message, "Google Drive ещё не настроен. Сначала добавь адрес Apps Script и общий ключ в Render.")
+        return
+    try:
+        files = await GoogleDriveService.list_snapshots(limit=10)
+    except Exception as exc:
+        logging.exception("Could not list Google Drive backups")
+        await render_menu_panel(message, f"❌ Не удалось получить список копий: {str(exc)[:700]}", reply_markup=main_menu_keyboard())
+        return
+    if not files:
+        await render_menu_panel(message, "В папке Google Drive пока нет копий базы. Создай первую командой /drive_backup.", reply_markup=main_menu_keyboard())
+        return
+
+    buttons = []
+    lines = ["☁️ Копии базы в Google Drive", "", "Выбери копию для восстановления:"]
+    for index, item in enumerate(files, 1):
+        name = str(item.get("name", "Резервная копия"))
+        created = str(item.get("createdTime", ""))[:16].replace("T", " ")
+        lines.append(f"{index}. {created or name} ({item.get('size', '—')} байт)")
+        buttons.append([InlineKeyboardButton(text=f"↩️ Восстановить #{index}", callback_data=f"gdrive_restore_{item['id']}")])
+    await render_menu_panel(message, "\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+@dp.callback_query(F.data.startswith("gdrive_restore_"))
+async def drive_restore_select_handler(callback: CallbackQuery):
+    if not _is_owner(callback.from_user.id):
+        await callback.answer("Только владелец может восстанавливать базу.", show_alert=True)
+        return
+    file_id = callback.data.removeprefix("gdrive_restore_")
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚠️ Да, заменить базу", callback_data=f"gdrive_confirm_{file_id}")],
+        [InlineKeyboardButton(text="Отмена", callback_data="gdrive_restore_cancel")],
+    ])
+    await render_menu_panel(
+        callback,
+        "⚠️ Восстановить эту копию? Текущие данные Turso будут заменены. Перед этим бот попробует сохранить текущую непустую базу в Google Drive.",
+        reply_markup=keyboard,
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "gdrive_restore_cancel")
+async def drive_restore_cancel_handler(callback: CallbackQuery):
+    await render_menu_panel(callback, "Восстановление отменено.", reply_markup=main_menu_keyboard())
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("gdrive_confirm_"))
+async def drive_restore_confirm_handler(callback: CallbackQuery):
+    if not _is_owner(callback.from_user.id):
+        await callback.answer("Только владелец может восстанавливать базу.", show_alert=True)
+        return
+    file_id = callback.data.removeprefix("gdrive_confirm_")
+    restore_dir = Path("data/import_tmp")
+    restore_dir.mkdir(parents=True, exist_ok=True)
+    restore_path = restore_dir / f"gdrive-restore-{uuid.uuid4().hex}.sqlite3"
+    await callback.answer("Восстанавливаю базу…")
+    try:
+        if BackupService.has_user_data():
+            safety = await _upload_drive_database_snapshot()
+            logging.info("Saved pre-restore Google Drive snapshot %s", safety.get("id"))
+        await GoogleDriveService.download_snapshot(file_id, restore_path)
+        source = sqlite3.connect(str(restore_path))
+        try:
+            integrity = source.execute("PRAGMA integrity_check").fetchone()
+            tables = {row[0] for row in source.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            required = {"vault_items", "vault_folders", "reminders", "bot_meta"}
+            if not integrity or integrity[0] != "ok" or not required.issubset(tables):
+                raise ValueError("Файл не похож на полноценную базу этого бота")
+            restore_from_sqlite_snapshot(restore_path)
+        finally:
+            source.close()
+        init_db()
+        await render_menu_panel(callback, "✅ База восстановлена из Google Drive.", reply_markup=main_menu_keyboard())
+    except Exception as exc:
+        logging.exception("Google Drive restore failed")
+        await render_menu_panel(callback, f"❌ Не удалось восстановить базу: {str(exc)[:700]}", reply_markup=main_menu_keyboard())
     finally:
         restore_path.unlink(missing_ok=True)
 
@@ -2928,6 +3053,8 @@ async def main():
             BotCommand(command="help", description="Помощь"),
             BotCommand(command="backup", description="Сделать резервную копию"),
             BotCommand(command="restore", description="Восстановить базу из ответа"),
+            BotCommand(command="drive_backup", description="Копия базы в Google Drive"),
+            BotCommand(command="drive_backups", description="Копии и восстановление из Drive"),
             BotCommand(command="status", description="Состояние бота и резервных копий"),
         ])
         await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
