@@ -46,7 +46,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from src.config import get_settings
-from src.db.database import DATABASE_FILE, get_connection, init_db
+from src.db.database import DATABASE_FILE, DATABASE_BACKEND, get_connection, init_db, restore_from_sqlite_snapshot
 from src.keyboards.vault_keyboard import (
     all_items_keyboard,
     back_keyboard,
@@ -1521,12 +1521,12 @@ async def status_command_handler(message: Message):
         "📊 Статус бота\n\n"
         f"• Health server: {'on' if health else 'off'}\n"
         f"• Каталог: {item_count} материалов\n"
-        f"• База: {DATABASE_FILE}\n"
+        f"• База: {'Turso Cloud' if DATABASE_BACKEND == 'turso' else DATABASE_FILE}\n"
         f"• Backup recipients: {len(backup_recipients)}\n"
         f"• Автобэкап: раз в {settings.backup_interval_hours} ч.\n"
         f"• Последний бэкап: {last_backup}"
     )
-    if settings.render_free_mode:
+    if settings.render_free_mode and DATABASE_BACKEND == "sqlite":
         text += "\n\n⚠️ Render Free удаляет локальную базу при redeploy/restart. Для постоянного хранения нужен Persistent Disk на платном плане."
     if not backup_recipients:
         text += "\n\n❌ Автобэкап выключен: укажи свой Telegram ID в OWNER_USER_IDS или ALLOWED_USER_IDS в Render."
@@ -1585,11 +1585,7 @@ async def restore_command_handler(message: Message):
             if not integrity or integrity[0] != "ok" or not required.issubset(tables):
                 raise ValueError("Файл не похож на полноценную базу этого бота")
 
-            destination = sqlite3.connect(str(DATABASE_FILE))
-            try:
-                source.backup(destination)
-            finally:
-                destination.close()
+            restore_from_sqlite_snapshot(restore_path)
         finally:
             source.close()
 
@@ -1600,6 +1596,7 @@ async def restore_command_handler(message: Message):
         await _send_text(message, f"❌ Не удалось восстановить базу: {exc}")
     finally:
         restore_path.unlink(missing_ok=True)
+
 
 @dp.callback_query(F.data == "folder_create")
 async def folder_create_callback(callback: CallbackQuery, state: FSMContext):

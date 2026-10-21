@@ -2,15 +2,108 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import logging
 from pathlib import Path
 
 from src.utils.folder_emojis import random_folder_emoji
 
+DATABASE_BACKEND = os.getenv("DATABASE_BACKEND", "sqlite").strip().lower()
 DATABASE_FILE = Path(os.getenv("DATABASE_PATH", "data/bot.sqlite3"))
-DATABASE_FILE.parent.mkdir(parents=True, exist_ok=True)
+if DATABASE_BACKEND == "sqlite":
+    DATABASE_FILE.parent.mkdir(parents=True, exist_ok=True)
+elif DATABASE_BACKEND != "turso":
+    raise RuntimeError("DATABASE_BACKEND must be 'sqlite' or 'turso'")
+
+
+class _NamedRow:
+    """sqlite3.Row-like access for DB-API drivers that return tuples."""
+    def __init__(self, names, values):
+        self._names = list(names)
+        self._values = tuple(values)
+        self._mapping = dict(zip(self._names, self._values))
+
+    def __getitem__(self, key):
+        return self._mapping[key] if isinstance(key, str) else self._values[key]
+
+    def __iter__(self):
+        return iter(self._values)
+
+    def __len__(self):
+        return len(self._values)
+
+    def keys(self):
+        return self._names
+
+
+class _TursoCursor:
+    def __init__(self, cursor):
+        self._cursor = cursor
+        description = getattr(cursor, "description", None) or ()
+        self._names = [
+            column[0] if isinstance(column, (tuple, list))
+            else getattr(column, "name", column)
+            for column in description
+        ]
+        self.rowcount = getattr(cursor, "rowcount", -1)
+        self.lastrowid = getattr(cursor, "lastrowid", None)
+
+    def fetchone(self):
+        row = self._cursor.fetchone()
+        return _NamedRow(self._names, row) if row is not None and self._names else row
+
+    def fetchall(self):
+        rows = self._cursor.fetchall()
+        return [_NamedRow(self._names, row) for row in rows] if self._names else rows
+
+    def __iter__(self):
+        while True:
+            row = self.fetchone()
+            if row is None:
+                break
+            yield row
+
+
+class _TursoConnection:
+    """Small DB-API compatibility shim; queries go only to Turso, never local SQLite."""
+    def __init__(self, connection):
+        self._connection = connection
+
+    def execute(self, sql, parameters=()):
+        return _TursoCursor(self._connection.execute(sql, parameters))
+
+    def executescript(self, script):
+        # sqlite3.complete_statement correctly handles semicolons inside strings.
+        statement = ""
+        for line in script.splitlines(keepends=True):
+            statement += line
+            if sqlite3.complete_statement(statement):
+                if statement.strip():
+                    self.execute(statement)
+                statement = ""
+        if statement.strip():
+            self.execute(statement)
+
+    def commit(self):
+        self._connection.commit()
+
+    def close(self):
+        self._connection.close()
+
+    def rollback(self):
+        self._connection.rollback()
 
 
 def get_connection():
+    if DATABASE_BACKEND == "turso":
+        url = os.getenv("TURSO_DATABASE_URL", "").strip()
+        token = os.getenv("TURSO_AUTH_TOKEN", "").strip()
+        if not url or not token:
+            raise RuntimeError("DATABASE_BACKEND=turso requires TURSO_DATABASE_URL and TURSO_AUTH_TOKEN; refusing local fallback")
+        try:
+            import libsql
+        except ImportError as exc:
+            raise RuntimeError("Turso driver is missing. Rebuild the deployment with requirements.txt.") from exc
+        return _TursoConnection(libsql.connect(database=url, auth_token=token))
     conn = sqlite3.connect(DATABASE_FILE)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON;")
@@ -30,6 +123,15 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column_sql: str):
 
 def init_db():
     conn = get_connection()
+    if DATABASE_BACKEND == "turso":
+        try:
+            conn.execute("PRAGMA foreign_keys = ON;")
+        except Exception:
+            # Turso does not implement every SQLite PRAGMA; keep the startup
+            # explicit and rely on the database's configured FK behavior.
+            logging.getLogger(__name__).warning("Turso did not accept PRAGMA foreign_keys; continuing with server defaults")
+    else:
+        conn.execute("PRAGMA foreign_keys = ON;")
 
     conn.executescript("""
     CREATE TABLE IF NOT EXISTS vault_folders (
@@ -257,3 +359,107 @@ def init_db():
 
     conn.commit()
     conn.close()
+
+
+def create_sqlite_snapshot(destination: Path) -> None:
+    """Write a consistent portable SQLite snapshot of the configured database."""
+    if DATABASE_BACKEND == "sqlite":
+        source = sqlite3.connect(str(DATABASE_FILE))
+        target = sqlite3.connect(str(destination))
+        try:
+            source.backup(target)
+        finally:
+            target.close()
+            source.close()
+        return
+
+    conn = get_connection()
+    target = sqlite3.connect(str(destination))
+    try:
+        objects = conn.execute(
+            "SELECT type, name, sql FROM sqlite_master "
+            "WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' "
+            "ORDER BY CASE type WHEN 'table' THEN 0 WHEN 'index' THEN 1 WHEN 'view' THEN 2 ELSE 3 END"
+        ).fetchall()
+        table_names = [row["name"] for row in objects if row["type"] == "table"]
+        for row in objects:
+            if row["type"] == "table":
+                target.execute(row["sql"])
+        for table in table_names:
+            quoted = '"' + table.replace('"', '""') + '"'
+            cursor = conn.execute(f"SELECT * FROM {quoted}")
+            rows = cursor.fetchall()
+            if not rows:
+                continue
+            columns = rows[0].keys() if hasattr(rows[0], "keys") else cursor._names
+            marks = ",".join("?" for _ in columns)
+            target.executemany(f"INSERT INTO {quoted} VALUES ({marks})", [tuple(row) for row in rows])
+        for row in objects:
+            if row["type"] != "table":
+                target.execute(row["sql"])
+        target.commit()
+    finally:
+        target.close()
+        conn.close()
+
+
+def restore_from_sqlite_snapshot(source_path: Path) -> None:
+    """Restore a validated SQLite snapshot into the active backend."""
+    if DATABASE_BACKEND == "sqlite":
+        source = sqlite3.connect(str(source_path))
+        destination = sqlite3.connect(str(DATABASE_FILE))
+        try:
+            source.backup(destination)
+        finally:
+            destination.close()
+            source.close()
+        return
+
+    source = sqlite3.connect(str(source_path))
+    source.row_factory = sqlite3.Row
+    remote = get_connection()
+    try:
+        objects = source.execute(
+            "SELECT type, name, sql FROM sqlite_master "
+            "WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' "
+            "ORDER BY CASE type WHEN 'table' THEN 0 WHEN 'index' THEN 1 WHEN 'view' THEN 2 ELSE 3 END"
+        ).fetchall()
+        try:
+            remote.execute("PRAGMA foreign_keys = OFF")
+        except Exception:
+            pass
+        remote.execute("BEGIN")
+        existing_views = remote.execute("SELECT name FROM sqlite_master WHERE type='view'").fetchall()
+        existing = remote.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").fetchall()
+        for row in existing_views:
+            name = row["name"]
+            quoted = '"' + name.replace('"', '""') + '"'
+            remote.execute(f"DROP VIEW IF EXISTS {quoted}")
+        for row in reversed(existing):
+            name = row["name"]
+            quoted = '"' + name.replace('"', '""') + '"'
+            remote.execute(f"DROP TABLE IF EXISTS {quoted}")
+        for row in objects:
+            if row["type"] == "table":
+                remote.execute(row["sql"])
+        for row in objects:
+            if row["type"] == "table":
+                name = row["name"]
+                quoted = '"' + name.replace('"', '""') + '"'
+                columns = [column[1] for column in source.execute(f"PRAGMA table_info({quoted})").fetchall()]
+                marks = ",".join("?" for _ in columns)
+                for values in source.execute(f"SELECT * FROM {quoted}"):
+                    remote.execute(f"INSERT INTO {quoted} VALUES ({marks})", tuple(values))
+        for row in objects:
+            if row["type"] != "table":
+                remote.execute(row["sql"])
+        remote.commit()
+    except Exception:
+        try:
+            remote.rollback()
+        except Exception:
+            logging.getLogger(__name__).exception("Turso rollback failed after restore error")
+        raise
+    finally:
+        source.close()
+        remote.close()

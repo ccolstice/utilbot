@@ -57,7 +57,8 @@ def get_settings() -> Settings:
         raise RuntimeError("BOT_TOKEN is not set")
 
     db_path = Path(os.getenv("DATABASE_PATH", "data/bot.sqlite3"))
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+    if os.getenv("DATABASE_BACKEND", "sqlite").strip().lower() == "sqlite":
+        db_path.parent.mkdir(parents=True, exist_ok=True)
 
     render_free_mode = _env_bool("RENDER_FREE_MODE", "0")
     allowed_user_ids = _parse_ids(os.getenv("ALLOWED_USER_IDS"))
