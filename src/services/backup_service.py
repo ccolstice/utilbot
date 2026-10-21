@@ -10,7 +10,7 @@ from typing import Iterable
 from aiogram import Bot
 from aiogram.types import FSInputFile
 
-from src.db.database import DATABASE_FILE, get_connection
+from src.db.database import DATABASE_FILE, DATABASE_BACKEND, create_sqlite_snapshot, get_connection
 
 logger = logging.getLogger(__name__)
 
@@ -24,13 +24,7 @@ class BackupService:
         cls.BACKUP_DIR.mkdir(parents=True, exist_ok=True)
         stamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S-%f")
         backup_path = cls.BACKUP_DIR / f"{prefix}-{stamp}.sqlite3"
-        source = sqlite3.connect(str(DATABASE_FILE))
-        destination = sqlite3.connect(str(backup_path))
-        try:
-            source.backup(destination)
-        finally:
-            destination.close()
-            source.close()
+        create_sqlite_snapshot(backup_path)
         check = sqlite3.connect(str(backup_path))
         try:
             result = check.execute("PRAGMA integrity_check").fetchone()
@@ -44,9 +38,9 @@ class BackupService:
     @staticmethod
     def has_user_data() -> bool:
         """Avoid replacing a useful Telegram backup with a freshly-reset empty Render DB."""
-        if not DATABASE_FILE.exists():
+        if DATABASE_BACKEND == "sqlite" and not DATABASE_FILE.exists():
             return False
-        conn = sqlite3.connect(str(DATABASE_FILE))
+        conn = get_connection()
         try:
             for table in ("vault_items", "reminders", "rss_feeds", "collections"):
                 try:

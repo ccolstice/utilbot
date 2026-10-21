@@ -85,3 +85,7 @@
 - Проверь логи Render: если команда пришла от пользователя вне allow-list, бот теперь пишет предупреждение про `ALLOWED_USER_IDS` и `OWNER_USER_IDS`; если polling стартовал, будет строка `Starting Telegram polling`.
 - Если команда вообще не появляется в логах, проверь, что Web Service запущен и что не запущена вторая копия бота с тем же токеном. Telegram допускает только один активный long-polling процесс на токен.
 - При старте приложение удаляет настроенный webhook, сохраняя очередь обновлений, потому что этот проект работает через long polling.
+
+## Turso Cloud
+
+Turso can be used as the active database with `DATABASE_BACKEND=turso`. Set `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` in the environment. Use `scripts/import_sqlite_to_turso.py` to import an existing SQLite snapshot into a new, empty test database; the source snapshot is left unchanged. The importer refuses to overwrite a non-empty database unless `--replace-existing` is explicitly supplied.
