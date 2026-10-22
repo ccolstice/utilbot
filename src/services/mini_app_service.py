@@ -12,7 +12,7 @@ import aiohttp
 from aiohttp import web
 
 from src.config import Settings
-from src.db.database import get_connection
+from src.db.database import DATABASE_BACKEND, get_connection
 from src.services.tag_service import format_tags, merge_user_tags
 from src.services.vault_service import VaultService
 from src.utils.filters import is_allowed_user
@@ -164,10 +164,14 @@ class MiniAppService:
             params.append(state)
         if favorite:
             clauses.append("COALESCE(i.is_favorite, 0) = 1")
-        if tag:
+        # SQLite supports registering a Python unicode-aware function on each
+        # connection. Remote Turso connections do not; for Turso, apply these
+        # text filters to the fetched rows below so Cyrillic search still works.
+        turso_backend = DATABASE_BACKEND == "turso"
+        if tag and not turso_backend:
             clauses.append("unicode_lower(COALESCE(i.tag, '')) LIKE ?")
             params.append(f"%{tag.casefold().lstrip('#')}%")
-        if query:
+        if query and not turso_backend:
             like = f"%{query.casefold()}%"
             clauses.append("(" + " OR ".join([
                 "unicode_lower(COALESCE(i.content, '')) LIKE ?",
@@ -184,22 +188,42 @@ class MiniAppService:
 
         where = " AND ".join(clauses)
         conn = get_connection()
-        conn.create_function("unicode_lower", 1, lambda value: str(value or "").casefold())
+        if not turso_backend:
+            conn.create_function("unicode_lower", 1, lambda value: str(value or "").casefold())
         try:
-            total = int(conn.execute(
-                f"SELECT COUNT(*) AS n FROM vault_items i JOIN vault_folders f ON f.id = i.folder_id WHERE {where}",
-                params,
-            ).fetchone()["n"])
-            rows = conn.execute(
-                f"""SELECT i.id, i.kind, i.content, i.tag, i.manual_tag, i.file_name,
-                           i.file_size, i.media_type, i.sender_name, i.created_at,
-                           i.item_state, i.is_favorite, i.context_text, i.telegram_file_id,
-                           i.link_url, i.page_title, f.name AS folder_name, f.emoji AS folder_emoji
-                    FROM vault_items i JOIN vault_folders f ON f.id = i.folder_id
-                    WHERE {where}
-                    ORDER BY i.id DESC LIMIT ? OFFSET ?""",
-                [*params, page_size, (page - 1) * page_size],
-            ).fetchall()
+            select_sql = f"""SELECT i.id, i.kind, i.content, i.tag, i.manual_tag, i.file_name,
+                               i.file_size, i.media_type, i.sender_name, i.source_chat_title, i.created_at,
+                               i.item_state, i.is_favorite, i.context_text, i.telegram_file_id,
+                               i.link_url, i.page_title, f.name AS folder_name, f.emoji AS folder_emoji
+                        FROM vault_items i JOIN vault_folders f ON f.id = i.folder_id
+                        WHERE {where} ORDER BY i.id DESC"""
+            if turso_backend:
+                rows = conn.execute(select_sql, params).fetchall()
+                if tag:
+                    tag_needle = tag.casefold().lstrip("#")
+                    rows = [row for row in rows if tag_needle in str(row["tag"] or "").casefold()]
+                if query:
+                    query_needle = query.casefold()
+                    search_fields = (
+                        "content", "context_text", "tag", "file_name", "sender_name",
+                        "source_chat_title", "link_url", "page_title", "folder_name",
+                    )
+                    rows = [
+                        row for row in rows
+                        if any(query_needle in str(row[field] or "").casefold() for field in search_fields)
+                    ]
+                total = len(rows)
+                offset = (page - 1) * page_size
+                rows = rows[offset:offset + page_size]
+            else:
+                total = int(conn.execute(
+                    f"SELECT COUNT(*) AS n FROM vault_items i JOIN vault_folders f ON f.id = i.folder_id WHERE {where}",
+                    params,
+                ).fetchone()["n"])
+                rows = conn.execute(
+                    select_sql + " LIMIT ? OFFSET ?",
+                    [*params, page_size, (page - 1) * page_size],
+                ).fetchall()
         finally:
             conn.close()
 
