@@ -3,22 +3,26 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-    <meta name="theme-color" content="#101923">
-    <title>Архив</title>
-    <link rel="stylesheet" href="/miniapp/styles.css?v=5">
+    <meta name="theme-color" content="#111019">
+    <title>Мой архив · Утиляшка</title>
+    <link rel="stylesheet" href="/miniapp/styles.css?v=6">
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
-    <script src="/miniapp/app.js?v=5" defer></script>
+    <script src="/miniapp/app.js?v=6" defer></script>
   </head>
   <body>
     <main class="app-shell">
       <header class="topbar">
-        <div>
-          <p class="eyebrow">ЛИЧНОЕ ХРАНИЛИЩЕ</p>
-          <h1>Архив</h1>
+        <div class="brand-lockup">
+          <span class="brand-mark" aria-hidden="true">✦</span>
+          <div class="brand-copy">
+            <p class="eyebrow">УТИЛЯШКА <span>✷</span> ЛИЧНОЕ ХРАНИЛИЩЕ</p>
+            <h1>Мой архив<span class="title-star" aria-hidden="true">✦</span></h1>
+            <p class="brand-subtitle">бережно храню твой хаос</p>
+          </div>
         </div>
         <div class="top-actions">
           <span id="result-count" class="result-count">Загрузка…</span>
-          <button id="select-mode" class="quiet-button" type="button">Выбрать</button>
+          <button id="select-mode" class="quiet-button select-button" type="button"><span aria-hidden="true">✣</span> Выбрать</button>
         </div>
       </header>
 
@@ -28,6 +32,7 @@
           <input id="search" type="search" placeholder="Найти в архиве" autocomplete="off">
           <button id="clear-search" class="clear-search" type="button" aria-label="Очистить поиск">×</button>
         </label>
+        <div class="filter-caption"><span>РАЗЛОЖИМ ПО ПОЛОЧКАМ?</span><i aria-hidden="true">✷</i></div>
         <div class="filters-row">
           <div class="folder-filter-row"><select id="folder-filter" aria-label="Папка"><option value="">Все папки</option></select><button id="create-folder" class="quiet-button" type="button">＋ Папка</button></div>
           <select id="kind-filter" aria-label="Тип материала">
@@ -50,7 +55,12 @@
       </section>
 
       <section id="folder-drop-zone" class="folder-drop-zone" aria-label="Переместить в папку" hidden>
-        <span class="drop-zone-hint">Перетащи материал в папку</span><div id="folder-drop-targets" class="folder-drop-targets"></div>
+        <div class="drop-head">
+          <span class="drop-sticker" aria-hidden="true">✦</span>
+          <div><strong>Куда переложить?</strong><span class="drop-zone-hint">Отпусти над папкой</span></div>
+          <button id="cancel-drag" type="button" aria-label="Отменить перенос">×</button>
+        </div>
+        <div id="folder-drop-targets" class="folder-drop-targets"></div>
       </section>
 
       <div id="error-banner" class="error-banner" hidden></div>
