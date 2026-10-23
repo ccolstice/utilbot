@@ -6,7 +6,7 @@
 
   const initData = tg?.initData || "";
   const apiHeaders = { "X-Telegram-Init-Data": initData };
-  const state = { page: 1, total: 0, pageSize: 24, folders: [], selected: new Set(), selectMode: false, timer: null, currentItems: [] };
+  const state = { page: 1, total: 0, pageSize: 24, folders: [], sources: [], source: null, reminders: [], selected: new Set(), selectMode: false, timer: null, currentItems: [] };
   const $ = (id) => document.getElementById(id);
   const grid = $("item-grid");
 
@@ -55,11 +55,27 @@
     select.value = current;
     $("folder-drop-targets").innerHTML = state.folders.map((folder) => `<button class="folder-drop-target" type="button" data-folder-id="${folder.id}">${escapeHtml(folder.emoji || "📁")} ${escapeHtml(folder.name)}</button>`).join("");
   }
+  async function loadSources() {
+    const data = await api("/api/miniapp/sources");
+    state.sources = data.sources || [];
+    renderSources();
+  }
+  function renderSources() {
+    const query = $("source-search").value.trim().toLocaleLowerCase("ru");
+    const sources = state.sources.filter((source) => source.label.toLocaleLowerCase("ru").includes(query));
+    const all = `<button type="button" class="source-option${state.source ? "" : " selected"}" data-source-clear="1"><span>✧ Все источники</span><small>Не фильтровать</small></button>`;
+    const entries = sources.map((source) => `<button type="button" class="source-option${state.source?.type === source.type && state.source?.value === source.value ? " selected" : ""}" data-source-type="${escapeHtml(source.type)}" data-source-value="${escapeHtml(source.value)}" data-source-label="${escapeHtml(source.label)}"><span>${escapeHtml(source.label)}</span><small>${source.item_count} · последнее ${escapeHtml(displayDate(source.last_at))}</small></button>`).join("");
+    $("source-list").innerHTML = sources.length ? all + entries : all + '<p class="action-note">Другие источники пока не найдены.</p>';
+    const button = $("source-filter");
+    button.textContent = state.source ? `✧ ${state.source.label}` : "✧ Источник: любой";
+    button.setAttribute("aria-expanded", $("source-dialog").open ? "true" : "false");
+  }
   function filters() {
     return new URLSearchParams({
       q: $("search").value.trim(), folder: $("folder-filter").value,
       kind: $("kind-filter").value, state: $("state-filter").value,
       tag: $("tag-filter").value.trim(), favorite: $("favorites-filter").getAttribute("aria-pressed") === "true" ? "1" : "0",
+      source_type: state.source?.type || "", source_value: state.source?.value || "",
       page: String(state.page),
     });
   }
@@ -126,6 +142,66 @@
       image.src = URL.createObjectURL(await response.blob());
     } catch { image.parentElement.innerHTML = '<span class="preview-placeholder">▧</span>'; }
   }
+  function isVisualItem(item) {
+    return item?.kind === "photo" || (item?.kind === "sticker" && item.mime_type === "image/webp");
+  }
+  async function showMediaViewerItem(index) {
+    const items = state.mediaViewerItems || [];
+    if (!items.length) return;
+    if (state.mediaViewerObjectUrl) URL.revokeObjectURL(state.mediaViewerObjectUrl);
+    state.mediaViewerObjectUrl = null;
+    state.mediaViewerIndex = (index + items.length) % items.length;
+    const item = items[state.mediaViewerIndex];
+    const requestId = state.mediaViewerRequest = (state.mediaViewerRequest || 0) + 1;
+    const image = document.createElement("img");
+    image.alt = titleFor(item);
+    $("media-viewer-content").replaceChildren(image);
+    $("media-viewer-title").textContent = titleFor(item);
+    $("media-viewer-caption").textContent = `${state.mediaViewerIndex + 1} / ${items.length}${item.content ? ` · ${String(item.content).slice(0, 120)}` : ""}`;
+    $("media-viewer-prev").disabled = items.length < 2;
+    $("media-viewer-next").disabled = items.length < 2;
+    try {
+      if (item.preview_url) {
+        const response = await fetch(item.preview_url, { headers: apiHeaders });
+        if (!response.ok) throw new Error("Не удалось загрузить изображение.");
+        const objectUrl = URL.createObjectURL(await response.blob());
+        if (requestId !== state.mediaViewerRequest) { URL.revokeObjectURL(objectUrl); return; }
+        state.mediaViewerObjectUrl = objectUrl;
+        image.src = objectUrl;
+      } else {
+        const { url } = await api(`/api/miniapp/items/${item.id}/media-link`);
+        if (requestId === state.mediaViewerRequest) image.src = url;
+      }
+    } catch (error) {
+      if (requestId === state.mediaViewerRequest) $("media-viewer-caption").textContent = error.message;
+    }
+  }
+  function openMediaViewer(item) {
+    state.mediaViewerItems = state.currentItems.filter(isVisualItem);
+    let index = state.mediaViewerItems.findIndex((candidate) => candidate.id === item.id);
+    if (index < 0) { state.mediaViewerItems.unshift(item); index = 0; }
+    if (!$("media-viewer").open) $("media-viewer").showModal();
+    document.body.classList.add("media-open");
+    showMediaViewerItem(index);
+  }
+  $("media-viewer-prev").addEventListener("click", () => showMediaViewerItem(state.mediaViewerIndex - 1));
+  $("media-viewer-next").addEventListener("click", () => showMediaViewerItem(state.mediaViewerIndex + 1));
+  $("close-media-viewer").addEventListener("click", () => $("media-viewer").close());
+  $("media-viewer").addEventListener("close", () => {
+    document.body.classList.remove("media-open");
+    state.mediaViewerRequest = (state.mediaViewerRequest || 0) + 1;
+    if (state.mediaViewerObjectUrl) URL.revokeObjectURL(state.mediaViewerObjectUrl);
+    state.mediaViewerObjectUrl = null;
+    $("media-viewer-content").replaceChildren();
+  });
+  let mediaSwipeStartX = null;
+  $("media-viewer-content").addEventListener("touchstart", (event) => { mediaSwipeStartX = event.changedTouches[0]?.clientX ?? null; }, { passive: true });
+  $("media-viewer-content").addEventListener("touchend", (event) => {
+    if (mediaSwipeStartX === null) return;
+    const delta = event.changedTouches[0].clientX - mediaSwipeStartX;
+    mediaSwipeStartX = null;
+    if (Math.abs(delta) > 55 && state.mediaViewerItems?.length > 1) showMediaViewerItem(state.mediaViewerIndex + (delta < 0 ? 1 : -1));
+  }, { passive: true });
   function updatePagination() {
     const pages = Math.max(1, Math.ceil(state.total / state.pageSize));
     $("page-label").textContent = `${state.page} / ${pages}`;
@@ -151,13 +227,23 @@
     }
     openDetails(id);
   }
-  function openDetails(id) {
-    const item = state.currentItems.find((row) => row.id === id); if (!item) return;
+  function openDetails(itemOrId) {
+    const item = typeof itemOrId === "object" ? itemOrId : state.currentItems.find((row) => row.id === itemOrId);
+    if (!item) return;
     const tags = tagsOf(item).map((tag) => `<span class="tag-pill">#${escapeHtml(tag)}</span>`).join("");
     const stateLabels = { inbox: "Входящие", later: "На потом", saved: "Разобрано", done: "Готово" };
-    const media = item.preview_url ? `<img class="detail-image" data-preview="${item.id}" alt="Фото">` : "";
+    let media = "";
+    if (item.preview_url) media = `<img class="detail-image" data-preview="${item.id}" alt="Фото">`;
+    else if (item.has_media && ["video", "video_note", "animation"].includes(item.kind)) media = `<video class="detail-video" data-media controls playsinline preload="metadata" aria-label="${escapeHtml(titleFor(item))}"></video>`;
+    else if (item.has_media && ["voice", "audio"].includes(item.kind)) media = `<audio class="detail-audio" data-media controls preload="metadata" aria-label="${escapeHtml(titleFor(item))}"></audio>`;
+    else if (item.has_media && item.kind === "sticker" && item.mime_type === "image/webp") media = `<img class="detail-image" data-media alt="Стикер">`;
+    else if (item.has_media) media = `<a class="media-file-link" data-media href="#" target="_blank" rel="noopener">↗ Открыть файл${item.file_name ? `: ${escapeHtml(item.file_name)}` : ""}</a>`;
+    const mediaExpand = item.preview_url || (item.kind === "sticker" && item.mime_type === "image/webp")
+      ? '<button type="button" class="media-expand" data-expand-media>⛶ На весь экран</button>'
+      : ["video", "video_note", "animation"].includes(item.kind) ? '<button type="button" class="media-expand" data-expand-media>⛶ Развернуть видео</button>' : "";
     const text = item.content || item.link_url || item.file_name || "";
-    $("detail-content").innerHTML = `${media}<h2 class="detail-title">${escapeHtml(titleFor(item))}</h2>
+    $("detail-content").dataset.itemId = item.id;
+    $("detail-content").innerHTML = `${media}${mediaExpand}<h2 class="detail-title">${escapeHtml(titleFor(item))}</h2>
       <div class="detail-meta">${escapeHtml(item.folder_emoji || "📁")} ${escapeHtml(item.folder_name)} · ${escapeHtml(stateLabels[item.item_state] || item.item_state)} · ${escapeHtml(displayDate(item.created_at))}${item.sender_name ? ` · ${escapeHtml(item.sender_name)}` : ""}</div>
       ${tags ? `<div class="tag-list detail-tags">${tags}</div>` : ""}
       ${text ? `<div class="detail-text">${escapeHtml(text)}</div>` : ""}
@@ -165,11 +251,37 @@
       <div class="detail-actions">
         <button type="button" data-item-action="move">📁 Переместить</button><button type="button" data-item-action="tag">🏷 Тег</button>
         <button type="button" data-item-action="state">↔ Статус</button><button type="button" data-item-action="favorite">⭐ ${item.is_favorite ? "Убрать из избранного" : "В избранное"}</button>
+        <button type="button" data-item-action="remind">⏰ Напомнить</button>
         <button type="button" class="danger-action" data-item-action="delete">🗑 Удалить</button>
       </div>`;
     $("detail-dialog").showModal();
     const image = $("detail-content").querySelector("img[data-preview]"); if (image) fetchPhoto(image);
-    $("detail-content").querySelectorAll("[data-item-action]").forEach((button) => button.addEventListener("click", () => showAction(button.dataset.itemAction, [item.id], !item.is_favorite)));
+    const mediaNode = $("detail-content").querySelector("[data-media]");
+    if (mediaNode) api(`/api/miniapp/items/${item.id}/media-link`).then(({ url }) => {
+      if (!mediaNode.isConnected || $("detail-content").dataset.itemId !== String(item.id)) return;
+      mediaNode.src !== undefined ? (mediaNode.src = url) : (mediaNode.href = url);
+      if (mediaNode.load) mediaNode.load();
+    }).catch(() => { if (mediaNode.isConnected) mediaNode.replaceWith(Object.assign(document.createElement("p"), { className: "action-note", textContent: "Не удалось открыть файл. Попробуй открыть его в Telegram." })); });
+    $("detail-content").querySelectorAll("[data-item-action]").forEach((button) => button.addEventListener("click", () => {
+      if (button.dataset.itemAction === "remind") openReminderForm(item);
+      else showAction(button.dataset.itemAction, [item.id], !item.is_favorite);
+    }));
+    const imageNode = $("detail-content").querySelector("img[data-preview], img[data-media]");
+    imageNode?.addEventListener("click", () => openMediaViewer(item));
+    $("detail-content").querySelector("[data-expand-media]")?.addEventListener("click", () => {
+      if (imageNode) openMediaViewer(item);
+      else {
+        const video = $("detail-content").querySelector("video");
+        if (video?.requestFullscreen) {
+          try {
+            const fullscreen = video.requestFullscreen();
+            fullscreen?.catch?.(() => video.play());
+          } catch { video.play(); }
+        }
+        else if (video?.webkitEnterFullscreen) video.webkitEnterFullscreen();
+        else video?.play();
+      }
+    });
   }
 
   function showAction(action, overrideIds = null, favoriteValue = null) {
@@ -211,6 +323,92 @@
       } catch (error) { button.disabled = false; showError(error.message); $("action-dialog").close(); }
     });
   }
+
+  function localDateTimeValue(date) {
+    const local = new Date(date.getTime() - date.getTimezoneOffset() * 60000);
+    return local.toISOString().slice(0, 16);
+  }
+  function formatDue(value) {
+    const raw = String(value || "").replace(" ", "T");
+    const date = new Date(/[zZ]|[+-]\d\d:\d\d$/.test(raw) ? raw : `${raw}Z`);
+    return Number.isNaN(date.getTime()) ? "время не указано" : new Intl.DateTimeFormat("ru", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }).format(date);
+  }
+  async function loadReminders() {
+    const data = await api("/api/miniapp/reminders");
+    state.reminders = data.reminders || [];
+    $("open-reminders").textContent = state.reminders.length ? `⏰ ${state.reminders.length}` : "⏰ Напоминания";
+    $("reminder-list").innerHTML = state.reminders.length ? state.reminders.map((reminder) => `
+      <article class="reminder-row" data-reminder-id="${reminder.id}">
+        <div class="reminder-copy"><strong>${escapeHtml(reminder.title)}</strong><time>${escapeHtml(formatDue(reminder.due_at))}</time>
+          ${reminder.source_item_id ? `<small>Материал #${reminder.source_item_id}</small>` : ""}</div>
+        <div class="reminder-actions">
+          ${reminder.source_item_id ? `<button type="button" data-reminder-action="open" data-item-id="${reminder.source_item_id}" aria-label="Открыть материал">↗</button>` : ""}
+          <button type="button" data-reminder-action="snooze" aria-label="Отложить на час">＋1 ч</button>
+          <button type="button" data-reminder-action="done" aria-label="Завершить напоминание">✓</button>
+        </div>
+      </article>`).join("") : '<p class="action-note reminder-empty">Пока нет активных напоминаний. Открой материал и нажми «Напомнить».</p>';
+  }
+  function showReminders() {
+    $("reminder-create").hidden = true;
+    $("reminder-dialog").showModal();
+    loadReminders().catch((error) => showError(error.message));
+  }
+  function openReminderForm(item) {
+    $("detail-dialog").close();
+    state.reminderItemId = Number(item.id);
+    $("reminder-create").hidden = false;
+    $("reminder-title").value = titleFor(item).slice(0, 120);
+    const now = new Date();
+    $("reminder-due").min = localDateTimeValue(now);
+    const due = new Date(now.getTime() + 60 * 60 * 1000);
+    due.setMinutes(0, 0, 0);
+    if (due <= now) due.setHours(due.getHours() + 1);
+    $("reminder-due").value = localDateTimeValue(due);
+    $("reminder-dialog").showModal();
+    loadReminders().catch((error) => showError(error.message));
+    $("reminder-title").focus();
+  }
+  $("reminder-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const submit = event.currentTarget.querySelector('[type="submit"]');
+    submit.disabled = true;
+    try {
+      const dueAt = new Date($("reminder-due").value);
+      if (Number.isNaN(dueAt.getTime()) || dueAt <= new Date()) throw new Error("Выбери время в будущем.");
+      await api("/api/miniapp/reminders", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ source_item_id: state.reminderItemId, title: $("reminder-title").value.trim(), due_at: dueAt.toISOString() }),
+      });
+      $("reminder-create").hidden = true;
+      state.reminderItemId = null;
+      toast("Напоминание поставлено");
+      await loadReminders();
+    } catch (error) { showError(error.message); }
+    finally { submit.disabled = false; }
+  });
+  $("cancel-reminder-create").addEventListener("click", () => { state.reminderItemId = null; $("reminder-create").hidden = true; });
+  $("reminder-dialog").addEventListener("close", () => { state.reminderItemId = null; $("reminder-create").hidden = true; });
+  $("detail-dialog").addEventListener("close", () => {
+    $("detail-content").querySelectorAll("video, audio").forEach((player) => { player.pause(); player.removeAttribute("src"); player.load(); });
+  });
+  $("reminder-list").addEventListener("click", async (event) => {
+    const button = event.target.closest("button[data-reminder-action]");
+    if (!button) return;
+    const row = button.closest("[data-reminder-id]");
+    const id = Number(row.dataset.reminderId);
+    button.disabled = true;
+    try {
+      if (button.dataset.reminderAction === "open") {
+        const { item } = await api(`/api/miniapp/items/${Number(button.dataset.itemId)}`);
+        $("reminder-dialog").close(); openDetails(item);
+      } else {
+        const action = button.dataset.reminderAction === "done" ? "done" : "snooze";
+        await api(`/api/miniapp/reminders/${id}/${action}`, { method: "POST" });
+        toast(action === "done" ? "Напоминание закрыто" : "Отложено на час");
+        await loadReminders();
+      }
+    } catch (error) { button.disabled = false; showError(error.message); }
+  });
 
   async function moveOneToFolder(itemId, folderId) {
     try {
@@ -338,6 +536,19 @@
       $("folder-dialog").close(); form.reset(); await loadFolders(); $("folder-filter").value = String(result.folder.id); filtersChanged(); toast("Папка создана");
     } catch (error) { showError(error.message); } finally { button.disabled = false; }
   });
+  $("source-filter").addEventListener("click", () => { renderSources(); $("source-dialog").showModal(); $("source-filter").setAttribute("aria-expanded", "true"); });
+  $("source-dialog").addEventListener("close", () => $("source-filter").setAttribute("aria-expanded", "false"));
+  $("source-search").addEventListener("input", renderSources);
+  $("source-list").addEventListener("click", (event) => {
+    const button = event.target.closest("button");
+    if (!button) return;
+    if (button.hasAttribute("data-source-clear")) state.source = null;
+    else if (button.dataset.sourceType) state.source = { type: button.dataset.sourceType, value: button.dataset.sourceValue, label: button.dataset.sourceLabel };
+    else return;
+    $("source-search").value = "";
+    $("source-dialog").close(); renderSources(); filtersChanged();
+  });
+  $("open-reminders").addEventListener("click", showReminders);
   $("previous-page").addEventListener("click", () => { if (state.page > 1) { state.page--; loadItems(); window.scrollTo({ top: 0, behavior: "smooth" }); } });
   $("next-page").addEventListener("click", () => { if (state.page * state.pageSize < state.total) { state.page++; loadItems(); window.scrollTo({ top: 0, behavior: "smooth" }); } });
   function filtersChanged() {
@@ -348,8 +559,14 @@
   $("clear-search").addEventListener("click", () => { $("search").value = ""; filtersChanged(); });
   $("favorites-filter").addEventListener("click", () => { const button = $("favorites-filter"); button.setAttribute("aria-pressed", button.getAttribute("aria-pressed") === "true" ? "false" : "true"); filtersChanged(); });
   $("reset-filters").addEventListener("click", () => {
-    $("search").value = ""; $("folder-filter").value = ""; $("kind-filter").value = "all"; $("state-filter").value = "all"; $("tag-filter").value = ""; $("favorites-filter").setAttribute("aria-pressed", "false"); filtersChanged();
+    $("search").value = ""; $("folder-filter").value = ""; $("kind-filter").value = "all"; $("state-filter").value = "all"; $("tag-filter").value = ""; $("favorites-filter").setAttribute("aria-pressed", "false"); state.source = null; renderSources(); filtersChanged();
   });
 
-  loadFolders().then(loadItems).catch((error) => showError(error.message));
+  Promise.all([loadFolders(), loadSources(), loadReminders()]).then(loadItems).then(async () => {
+    const sourceItemId = Number(new URLSearchParams(window.location.search).get("item"));
+    if (sourceItemId) {
+      const { item } = await api(`/api/miniapp/items/${sourceItemId}`);
+      openDetails(item);
+    }
+  }).catch((error) => showError(error.message));
 })();

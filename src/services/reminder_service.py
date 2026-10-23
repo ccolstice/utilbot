@@ -391,7 +391,7 @@ async def reminder_worker(bot, interval_seconds: int = 30):
                 await bot.send_message(
                     user_id,
                     f"🔔 Напоминание\n\n{title}\n\n{extra}",
-                    reply_markup=reminder_notification_keyboard(reminder_id),
+                    reply_markup=reminder_notification_keyboard(reminder_id, row["source_item_id"]),
                 )
 
                 ReminderService.register_notification(user_id, reminder_id, DEFAULT_REMINDER_RETRY_MINUTES)

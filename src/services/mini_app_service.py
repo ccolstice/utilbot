@@ -4,9 +4,12 @@ import hashlib
 import hmac
 import json
 import logging
+import mimetypes
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qsl
+from urllib.parse import quote
 
 import aiohttp
 from aiohttp import web
@@ -14,6 +17,7 @@ from aiohttp import web
 from src.config import Settings
 from src.db.database import DATABASE_BACKEND, get_connection
 from src.services.tag_service import format_tags, merge_user_tags
+from src.services.reminder_service import ReminderService
 from src.services.vault_service import VaultService
 from src.utils.filters import is_allowed_user
 
@@ -39,9 +43,17 @@ class MiniAppService:
         app.router.add_static("/miniapp/", str(MINI_APP_DIR), show_index=False)
         app.router.add_get("/api/miniapp/folders", self.list_folders)
         app.router.add_post("/api/miniapp/folders", self.create_folder)
+        app.router.add_get("/api/miniapp/sources", self.list_sources)
         app.router.add_get("/api/miniapp/items", self.list_items)
+        app.router.add_get("/api/miniapp/items/{item_id:\\d+}", self.get_item)
+        app.router.add_get("/api/miniapp/items/{item_id:\\d+}/media-link", self.media_link)
         app.router.add_post("/api/miniapp/items/bulk", self.bulk_action)
         app.router.add_get("/api/miniapp/items/{item_id:\\d+}/preview", self.photo_preview)
+        app.router.add_get("/api/miniapp/media/{user_id:\\d+}/{item_id:\\d+}", self.stream_media)
+        app.router.add_get("/api/miniapp/reminders", self.list_reminders)
+        app.router.add_post("/api/miniapp/reminders", self.create_reminder)
+        app.router.add_post("/api/miniapp/reminders/{reminder_id:\\d+}/done", self.complete_reminder)
+        app.router.add_post("/api/miniapp/reminders/{reminder_id:\\d+}/snooze", self.snooze_reminder)
 
     async def redirect_to_app(self, request: web.Request) -> web.Response:
         raise web.HTTPFound("/miniapp/")
@@ -78,6 +90,7 @@ class MiniAppService:
             raise web.HTTPUnauthorized(text="В данных Telegram нет пользователя.")
         if not is_allowed_user(user_id, self.settings):
             raise web.HTTPForbidden(text="У этого аккаунта нет доступа к архиву.")
+        request["telegram_user"] = user
         return user_id
 
     async def list_folders(self, request: web.Request) -> web.Response:
@@ -126,6 +139,114 @@ class MiniAppService:
         return web.json_response({"folder": {**dict(folder), "item_count": 0}}, status=201,
                                  headers={"Cache-Control": "no-store"})
 
+    async def list_sources(self, request: web.Request) -> web.Response:
+        user_id = self._authenticated_user_id(request)
+        telegram_user = request.get("telegram_user", {})
+        own_username = str(telegram_user.get("username") or "").casefold()
+        own_name = " ".join(filter(None, [telegram_user.get("first_name"), telegram_user.get("last_name")])).casefold()
+        conn = get_connection()
+        try:
+            rows = conn.execute(
+                """SELECT source_chat_title, sender_username, sender_name, link_domain,
+                          COUNT(*) AS item_count, MAX(created_at) AS last_at
+                   FROM vault_items WHERE user_id = ?
+                   GROUP BY source_chat_title, sender_username, sender_name, link_domain""",
+                (user_id,),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        sources: dict[tuple[str, str], dict] = {}
+        for row in rows:
+            if row["source_chat_title"]:
+                source_type, value, label = "channel", row["source_chat_title"], row["source_chat_title"]
+            elif row["sender_username"] and str(row["sender_username"]).casefold() != own_username:
+                source_type, value, label = "username", row["sender_username"], "@" + row["sender_username"]
+            elif row["link_domain"]:
+                source_type, value, label = "site", row["link_domain"], row["link_domain"]
+            elif (row["sender_username"] and str(row["sender_username"]).casefold() == own_username) or (
+                row["sender_name"] and str(row["sender_name"]).casefold() == own_name
+            ):
+                source_type = "own"
+                value = row["sender_username"] or row["sender_name"]
+                label = "Личные сообщения"
+            elif row["sender_name"]:
+                source_type, value, label = "person", row["sender_name"], row["sender_name"]
+            else:
+                continue
+            key = (source_type, str(value))
+            if key not in sources:
+                sources[key] = {"type": source_type, "value": str(value), "label": str(label),
+                                "item_count": 0, "last_at": row["last_at"]}
+            sources[key]["item_count"] += int(row["item_count"] or 0)
+            if row["last_at"] and (not sources[key]["last_at"] or row["last_at"] > sources[key]["last_at"]):
+                sources[key]["last_at"] = row["last_at"]
+        ordered = sorted(sources.values(), key=lambda source: (-source["item_count"], source["label"].casefold()))[:150]
+        return web.json_response({"sources": ordered}, headers={"Cache-Control": "no-store"})
+
+    async def list_reminders(self, request: web.Request) -> web.Response:
+        user_id = self._authenticated_user_id(request)
+        rows = ReminderService.list_reminders(user_id, include_done=False, limit=100)
+        return web.json_response({"reminders": [dict(row) for row in rows]},
+                                 headers={"Cache-Control": "no-store"})
+
+    async def create_reminder(self, request: web.Request) -> web.Response:
+        user_id = self._authenticated_user_id(request)
+        try:
+            body = await request.json()
+            item_id = int(body.get("source_item_id"))
+            due_at = datetime.fromisoformat(str(body.get("due_at", "")).replace("Z", "+00:00"))
+        except (ValueError, TypeError, AttributeError, json.JSONDecodeError):
+            raise web.HTTPBadRequest(text="Укажи материал и корректное время напоминания.")
+        if due_at.tzinfo is None:
+            due_at = due_at.replace(tzinfo=timezone.utc)
+        due_at = due_at.astimezone(timezone.utc).replace(tzinfo=None, microsecond=0)
+        now = datetime.utcnow().replace(microsecond=0)
+        if due_at <= now:
+            raise web.HTTPBadRequest(text="Время напоминания должно быть в будущем.")
+        if (due_at - now).total_seconds() > 366 * 24 * 60 * 60:
+            raise web.HTTPBadRequest(text="Можно поставить напоминание не дальше чем на год.")
+        conn = get_connection()
+        try:
+            item = conn.execute(
+                "SELECT id, kind, content, page_title, file_name, tag FROM vault_items WHERE user_id = ? AND id = ?",
+                (user_id, item_id),
+            ).fetchone()
+        finally:
+            conn.close()
+        if not item:
+            raise web.HTTPNotFound(text="Материал не найден.")
+        title = str(body.get("title") or item["tag"] or item["content"] or item["page_title"] or item["file_name"] or {
+            "photo": "Фото", "video": "Видео", "voice": "Голосовое", "audio": "Аудио",
+            "video_note": "Видеосообщение", "document": "Файл", "link": "Ссылка",
+        }.get(item["kind"], "Материал")).strip()[:120]
+        if not title:
+            raise web.HTTPBadRequest(text="Напиши, о чём напомнить.")
+        reminder = ReminderService.create_reminder(
+            user_id=user_id, title=title, due_at=due_at, source_item_id=item_id,
+            note=f"Напоминание по материалу #{item_id}",
+        )
+        return web.json_response({"reminder": dict(reminder)}, status=201,
+                                 headers={"Cache-Control": "no-store"})
+
+    async def complete_reminder(self, request: web.Request) -> web.Response:
+        user_id = self._authenticated_user_id(request)
+        reminder_id = int(request.match_info["reminder_id"])
+        reminder = ReminderService.get_reminder(user_id, reminder_id)
+        if not reminder:
+            raise web.HTTPNotFound(text="Напоминание не найдено.")
+        updated = ReminderService.mark_done(user_id, reminder_id)
+        return web.json_response({"reminder": dict(updated)}, headers={"Cache-Control": "no-store"})
+
+    async def snooze_reminder(self, request: web.Request) -> web.Response:
+        user_id = self._authenticated_user_id(request)
+        reminder_id = int(request.match_info["reminder_id"])
+        reminder = ReminderService.get_reminder(user_id, reminder_id)
+        if not reminder:
+            raise web.HTTPNotFound(text="Напоминание не найдено.")
+        updated = ReminderService.snooze_reminder(user_id, reminder_id, 60)
+        return web.json_response({"reminder": dict(updated)}, headers={"Cache-Control": "no-store"})
+
     async def list_items(self, request: web.Request) -> web.Response:
         user_id = self._authenticated_user_id(request)
         query = (request.query.get("q") or "").strip()[:200]
@@ -133,6 +254,8 @@ class MiniAppService:
         kind = request.query.get("kind")
         state = request.query.get("state")
         folder_raw = request.query.get("folder")
+        source_type = request.query.get("source_type", "")
+        source_value = (request.query.get("source_value") or "")[:160]
         favorite = request.query.get("favorite") == "1"
         try:
             page = max(1, min(int(request.query.get("page", "1")), 100000))
@@ -164,10 +287,25 @@ class MiniAppService:
             params.append(state)
         if favorite:
             clauses.append("COALESCE(i.is_favorite, 0) = 1")
+        turso_backend = DATABASE_BACKEND == "turso"
+        source_columns = {"channel": "source_chat_title", "username": "sender_username",
+                          "person": "sender_name", "site": "link_domain"}
+        if source_type:
+            if source_type not in {*source_columns, "own"} or not source_value:
+                raise web.HTTPBadRequest(text="Некорректный источник.")
+            if not turso_backend:
+                if source_type == "own":
+                    telegram_user = request.get("telegram_user", {})
+                    own_username = str(telegram_user.get("username") or "").casefold()
+                    own_name = " ".join(filter(None, [telegram_user.get("first_name"), telegram_user.get("last_name")])).casefold()
+                    clauses.append("(unicode_lower(COALESCE(i.sender_username, '')) = ? OR unicode_lower(COALESCE(i.sender_name, '')) = ?)")
+                    params.extend([own_username or source_value.casefold(), own_name or source_value.casefold()])
+                else:
+                    clauses.append(f"unicode_lower(COALESCE(i.{source_columns[source_type]}, '')) = ?")
+                    params.append(source_value.casefold())
         # SQLite supports registering a Python unicode-aware function on each
         # connection. Remote Turso connections do not; for Turso, apply these
         # text filters to the fetched rows below so Cyrillic search still works.
-        turso_backend = DATABASE_BACKEND == "turso"
         if tag and not turso_backend:
             clauses.append("unicode_lower(COALESCE(i.tag, '')) LIKE ?")
             params.append(f"%{tag.casefold().lstrip('#')}%")
@@ -193,12 +331,23 @@ class MiniAppService:
         try:
             select_sql = f"""SELECT i.id, i.kind, i.content, i.tag, i.manual_tag, i.file_name,
                                i.file_size, i.media_type, i.sender_name, i.source_chat_title, i.created_at,
+                               i.sender_username, i.link_domain, i.mime_type, i.duration, i.width, i.height,
                                i.item_state, i.is_favorite, i.context_text, i.telegram_file_id,
                                i.link_url, i.page_title, f.name AS folder_name, f.emoji AS folder_emoji
                         FROM vault_items i JOIN vault_folders f ON f.id = i.folder_id
                         WHERE {where} ORDER BY i.id DESC"""
             if turso_backend:
                 rows = conn.execute(select_sql, params).fetchall()
+                if source_type:
+                    source_needle = source_value.casefold()
+                    if source_type == "own":
+                        telegram_user = request.get("telegram_user", {})
+                        own_username = str(telegram_user.get("username") or source_value).casefold()
+                        own_name = " ".join(filter(None, [telegram_user.get("first_name"), telegram_user.get("last_name")])).casefold()
+                        rows = [row for row in rows if str(row["sender_username"] or "").casefold() == own_username or str(row["sender_name"] or "").casefold() == own_name]
+                    else:
+                        field = source_columns[source_type]
+                        rows = [row for row in rows if str(row[field] or "").casefold() == source_needle]
                 if tag:
                     tag_needle = tag.casefold().lstrip("#")
                     rows = [row for row in rows if tag_needle in str(row["tag"] or "").casefold()]
@@ -236,11 +385,42 @@ class MiniAppService:
             item["context_text"] = (item["context_text"] or "")[:1200]
             item["is_favorite"] = bool(item["is_favorite"])
             item["preview_url"] = f"/api/miniapp/items/{item['id']}/preview" if has_photo else None
+            item["has_media"] = bool(item.get("telegram_file_id"))
             items.append(item)
         return web.json_response(
             {"items": items, "total": total, "page": page, "page_size": page_size},
             headers={"Cache-Control": "no-store"},
         )
+
+    async def get_item(self, request: web.Request) -> web.Response:
+        user_id = self._authenticated_user_id(request)
+        item_id = int(request.match_info["item_id"])
+        conn = get_connection()
+        try:
+            row = conn.execute(
+                """SELECT i.id, i.kind, i.content, i.tag, i.manual_tag, i.file_name,
+                          i.file_size, i.media_type, i.mime_type, i.duration, i.width, i.height,
+                          i.sender_name, i.sender_username, i.source_chat_title, i.created_at,
+                          i.item_state, i.is_favorite, i.context_text, i.telegram_file_id,
+                          i.link_url, i.page_title, i.link_domain,
+                          f.name AS folder_name, f.emoji AS folder_emoji
+                   FROM vault_items i JOIN vault_folders f ON f.id = i.folder_id
+                   WHERE i.user_id = ? AND i.id = ? AND f.archived_at IS NULL""",
+                (user_id, item_id),
+            ).fetchone()
+        finally:
+            conn.close()
+        if not row:
+            raise web.HTTPNotFound(text="Материал не найден.")
+        item = dict(row)
+        has_photo = item["kind"] == "photo" and bool(item["telegram_file_id"])
+        item["has_media"] = bool(item["telegram_file_id"])
+        item["preview_url"] = f"/api/miniapp/items/{item_id}/preview" if has_photo else None
+        item["content"] = (item["content"] or "")[:1800]
+        item["context_text"] = (item["context_text"] or "")[:1200]
+        item["is_favorite"] = bool(item["is_favorite"])
+        item.pop("telegram_file_id", None)
+        return web.json_response({"item": item}, headers={"Cache-Control": "no-store"})
 
     async def bulk_action(self, request: web.Request) -> web.Response:
         user_id = self._authenticated_user_id(request)
@@ -411,3 +591,98 @@ class MiniAppService:
                 type(exc).__name__,
             )
             raise web.HTTPBadGateway(text="Не удалось загрузить фото из Telegram.")
+
+    async def media_link(self, request: web.Request) -> web.Response:
+        user_id = self._authenticated_user_id(request)
+        item_id = int(request.match_info["item_id"])
+        conn = get_connection()
+        try:
+            row = conn.execute(
+                "SELECT telegram_file_id FROM vault_items WHERE user_id = ? AND id = ?",
+                (user_id, item_id),
+            ).fetchone()
+        finally:
+            conn.close()
+        if not row or not row["telegram_file_id"]:
+            raise web.HTTPNotFound(text="Файл у этого материала не найден.")
+        expires = int(time.time()) + 900
+        payload = f"{user_id}:{item_id}:{expires}".encode()
+        signature = hmac.new(self.settings.bot_token.encode(), payload, hashlib.sha256).hexdigest()
+        url = f"/api/miniapp/media/{user_id}/{item_id}?expires={expires}&signature={signature}"
+        return web.json_response({"url": url}, headers={"Cache-Control": "no-store"})
+
+    async def stream_media(self, request: web.Request) -> web.StreamResponse:
+        try:
+            user_id = int(request.match_info["user_id"])
+            item_id = int(request.match_info["item_id"])
+            expires = int(request.query["expires"])
+            signature = request.query["signature"]
+        except (ValueError, KeyError):
+            raise web.HTTPUnauthorized(text="Ссылка на файл некорректна.")
+        now = int(time.time())
+        if expires < now or expires > now + 900:
+            raise web.HTTPUnauthorized(text="Ссылка на файл устарела. Открой материал заново.")
+        payload = f"{user_id}:{item_id}:{expires}".encode()
+        expected = hmac.new(self.settings.bot_token.encode(), payload, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, signature):
+            raise web.HTTPUnauthorized(text="Ссылка на файл недействительна.")
+
+        conn = get_connection()
+        try:
+            row = conn.execute(
+                "SELECT telegram_file_id, mime_type, file_name FROM vault_items WHERE user_id = ? AND id = ?",
+                (user_id, item_id),
+            ).fetchone()
+        finally:
+            conn.close()
+        if not row or not row["telegram_file_id"]:
+            raise web.HTTPNotFound(text="Файл не найден.")
+
+        try:
+            telegram_file = await self.bot.get_file(row["telegram_file_id"])
+            if not telegram_file.file_path:
+                raise RuntimeError("Telegram returned no file path")
+            url = f"https://api.telegram.org/file/bot{self.settings.bot_token}/{telegram_file.file_path}"
+            timeout = aiohttp.ClientTimeout(total=None, sock_connect=15, sock_read=60)
+            upstream_headers = {"Range": request.headers["Range"]} if request.headers.get("Range") else {}
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url, headers=upstream_headers) as upstream:
+                    if upstream.status not in {200, 206}:
+                        raise RuntimeError(f"Telegram file server returned {upstream.status}")
+                    content_type = upstream.headers.get("Content-Type") or ""
+                    if not content_type or content_type.split(";", 1)[0].lower() == "application/octet-stream":
+                        content_type = row["mime_type"] or mimetypes.guess_type(telegram_file.file_path)[0] or content_type
+                    content_type = content_type or "application/octet-stream"
+                    inline_types = {
+                        "application/pdf", "audio/aac", "audio/mp4", "audio/mpeg", "audio/ogg",
+                        "audio/wav", "audio/webm", "image/gif", "image/jpeg", "image/png",
+                        "image/webp", "video/mp4", "video/quicktime", "video/webm",
+                    }
+                    filename = str(row["file_name"] or Path(telegram_file.file_path).name or f"material-{item_id}")
+                    disposition = "inline" if content_type.split(";", 1)[0].lower() in inline_types else "attachment"
+                    headers = {
+                        "Content-Type": content_type,
+                        "Content-Disposition": f"{disposition}; filename*=UTF-8''{quote(filename)}",
+                        "Cache-Control": "private, no-store",
+                        "X-Content-Type-Options": "nosniff",
+                        "Accept-Ranges": upstream.headers.get("Accept-Ranges", "bytes"),
+                    }
+                    for name in ("Content-Length", "Content-Range"):
+                        if upstream.headers.get(name):
+                            headers[name] = upstream.headers[name]
+                    response = web.StreamResponse(status=upstream.status, headers=headers)
+                    await response.prepare(request)
+                    async for chunk in upstream.content.iter_chunked(64 * 1024):
+                        await response.write(chunk)
+                    await response.write_eof()
+                    return response
+        except web.HTTPException:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Mini App media stream failed for user=%s item=%s (%s)",
+                user_id,
+                item_id,
+                type(exc).__name__,
+            )
+            raise web.HTTPBadGateway(text="Не удалось открыть файл из Telegram.")

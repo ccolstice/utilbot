@@ -5,9 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
     <meta name="theme-color" content="#111019">
     <title>Мой архив · Утиляшка</title>
-    <link rel="stylesheet" href="/miniapp/styles.css?v=6">
+    <link rel="stylesheet" href="/miniapp/styles.css?v=7">
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
-    <script src="/miniapp/app.js?v=6" defer></script>
+    <script src="/miniapp/app.js?v=7" defer></script>
   </head>
   <body>
     <main class="app-shell">
@@ -22,6 +22,7 @@
         </div>
         <div class="top-actions">
           <span id="result-count" class="result-count">Загрузка…</span>
+          <button id="open-reminders" class="quiet-button" type="button" aria-label="Напоминания" title="Напоминания">⏰</button>
           <button id="select-mode" class="quiet-button select-button" type="button"><span aria-hidden="true">✣</span> Выбрать</button>
         </div>
       </header>
@@ -52,6 +53,7 @@
           <label class="tag-filter"><span>#</span><input id="tag-filter" type="text" placeholder="Фильтр по тегу"></label>
           <button id="favorites-filter" class="chip-button" type="button" aria-pressed="false">☆ Избранное</button>
         </div>
+        <button id="source-filter" class="source-filter-button" type="button" aria-expanded="false">✧ Источник: любой</button>
       </section>
 
       <section id="folder-drop-zone" class="folder-drop-zone" aria-label="Переместить в папку" hidden>
@@ -105,6 +107,32 @@
         <label>Название<input name="name" maxlength="40" placeholder="Например, Идеи" required></label>
         <div class="form-actions"><button type="button" class="secondary" data-cancel>Отмена</button><button type="submit">Создать</button></div>
       </form>
+    </dialog>
+    <dialog id="source-dialog" class="sheet action-sheet">
+      <form method="dialog" class="sheet-close-row"><button class="close-button" aria-label="Закрыть">×</button></form>
+      <h2>Откуда этот материал?</h2>
+      <label class="search-box source-search"><span aria-hidden="true">⌕</span><input id="source-search" type="search" placeholder="Канал, человек или сайт" autocomplete="off"></label>
+      <div id="source-list" class="source-list"></div>
+    </dialog>
+    <dialog id="reminder-dialog" class="sheet action-sheet reminder-sheet">
+      <form method="dialog" class="sheet-close-row"><button class="close-button" aria-label="Закрыть">×</button></form>
+      <h2>⏰ Напоминания</h2>
+      <section id="reminder-create" class="reminder-create" hidden>
+        <p class="action-note">Вернём тебя к этому материалу в выбранное время.</p>
+        <form id="reminder-form" class="action-form">
+          <label>О чём напомнить<input id="reminder-title" name="title" maxlength="120" required></label>
+          <label>Когда<input id="reminder-due" name="due_at" type="datetime-local" required></label>
+          <div class="form-actions"><button type="button" class="secondary" id="cancel-reminder-create">Отмена</button><button type="submit">Напомнить</button></div>
+        </form>
+      </section>
+      <div id="reminder-list" class="reminder-list"></div>
+    </dialog>
+    <dialog id="media-viewer" class="media-viewer" aria-label="Просмотр медиа">
+      <div class="media-viewer-top"><strong id="media-viewer-title"></strong><button id="close-media-viewer" type="button" aria-label="Закрыть">×</button></div>
+      <button id="media-viewer-prev" class="media-nav prev" type="button" aria-label="Предыдущий материал">‹</button>
+      <div id="media-viewer-content" class="media-viewer-content"></div>
+      <button id="media-viewer-next" class="media-nav next" type="button" aria-label="Следующий материал">›</button>
+      <p id="media-viewer-caption" class="media-viewer-caption"></p>
     </dialog>
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
   </body>

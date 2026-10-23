@@ -156,9 +156,7 @@ def init_db():
         item_state TEXT NOT NULL DEFAULT 'saved',
         dedupe_key TEXT,
         voice_duration INTEGER,
-        extracted_text TEXT,
         transcript_text TEXT,
-        ocr_status TEXT DEFAULT NULL,
         transcript_status TEXT DEFAULT NULL,
         processing_started_at TIMESTAMP DEFAULT NULL,
         processing_completed_at TIMESTAMP DEFAULT NULL,
@@ -275,9 +273,7 @@ def init_db():
         "ON vault_items(user_id, dedupe_key)"
     )
     _ensure_column(conn, "vault_items", "voice_duration INTEGER")
-    _ensure_column(conn, "vault_items", "extracted_text TEXT")
     _ensure_column(conn, "vault_items", "transcript_text TEXT")
-    _ensure_column(conn, "vault_items", "ocr_status TEXT DEFAULT NULL")
     _ensure_column(conn, "vault_items", "transcript_status TEXT DEFAULT NULL")
     _ensure_column(conn, "vault_items", "processing_started_at TIMESTAMP DEFAULT NULL")
     _ensure_column(conn, "vault_items", "processing_completed_at TIMESTAMP DEFAULT NULL")
