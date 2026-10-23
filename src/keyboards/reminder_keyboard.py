@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+import os
+
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 
 
 def reminder_due_keyboard() -> InlineKeyboardMarkup:
@@ -107,5 +109,20 @@ def reminder_snooze_keyboard(reminder_id: int, page: int) -> InlineKeyboardMarku
     )
 
 
-def reminder_notification_keyboard(reminder_id: int) -> InlineKeyboardMarkup:
-    return reminder_detail_keyboard(reminder_id, 1)
+def reminder_notification_keyboard(reminder_id: int, source_item_id: int | None = None) -> InlineKeyboardMarkup:
+    keyboard = reminder_detail_keyboard(reminder_id, 1)
+    if source_item_id:
+        web_app_url = os.getenv("MINI_APP_URL", "").strip()
+        if not web_app_url:
+            render_url = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
+            if render_url.startswith("https://"):
+                web_app_url = f"{render_url}/miniapp/"
+        if web_app_url.startswith("https://"):
+            separator = "&" if "?" in web_app_url else "?"
+            keyboard.inline_keyboard.insert(0, [
+                InlineKeyboardButton(
+                    text="🗂 Открыть материал",
+                    web_app=WebAppInfo(url=f"{web_app_url}{separator}item={source_item_id}"),
+                )
+            ])
+    return keyboard
