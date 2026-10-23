@@ -219,12 +219,43 @@
     } catch (error) { $("folder-drop-zone").hidden = true; showError(error.message); }
   }
   let activeDrag = null;
+  let suppressDropClickUntil = 0;
   function clearActiveDrag() {
     if (!activeDrag) return;
     clearTimeout(activeDrag.timer); activeDrag.card.classList.remove("dragging"); activeDrag.ghost?.remove();
-    $("folder-drop-zone").hidden = true;
+    $("folder-drop-zone").hidden = true; document.body.classList.remove("drag-mode");
     $("folder-drop-targets").querySelectorAll(".drop-hover").forEach((node) => node.classList.remove("drop-hover"));
     activeDrag = null;
+  }
+  function beginDrag(drag, x, y) {
+    if (activeDrag !== drag) return;
+    drag.dragging = true; $("folder-drop-zone").hidden = false;
+    document.body.classList.add("drag-mode"); drag.card.classList.add("dragging");
+    drag.ghost = drag.card.cloneNode(true); drag.ghost.classList.add("drag-ghost");
+    drag.ghost.style.left = `${x + 14}px`; drag.ghost.style.top = `${y + 14}px`;
+    document.body.appendChild(drag.ghost);
+    tg?.HapticFeedback?.impactOccurred?.("light");
+  }
+  function moveDrag(x, y) {
+    const drag = activeDrag;
+    if (!drag?.dragging) return;
+    if (drag.ghost) { drag.ghost.style.left = `${x + 14}px`; drag.ghost.style.top = `${y + 14}px`; }
+    const targets = $("folder-drop-targets");
+    targets.querySelectorAll(".drop-hover").forEach((node) => node.classList.remove("drop-hover"));
+    document.elementFromPoint(x, y)?.closest(".folder-drop-target")?.classList.add("drop-hover");
+  }
+  function finishDrag(x, y) {
+    const drag = activeDrag;
+    if (!drag) return;
+    const folder = drag.dragging ? document.elementFromPoint(x, y)?.closest(".folder-drop-target") : null;
+    const folderId = folder ? Number(folder.dataset.folderId) : null;
+    const itemId = Number(drag.card.dataset.id);
+    if (drag.dragging) {
+      drag.card.dataset.suppressClick = "1";
+      suppressDropClickUntil = Date.now() + 700;
+    }
+    clearActiveDrag();
+    if (folderId) moveOneToFolder(itemId, folderId);
   }
   function enableLongPressMove(card) {
     card.addEventListener("click", (event) => {
@@ -232,39 +263,60 @@
       delete card.dataset.suppressClick; event.preventDefault(); event.stopImmediatePropagation();
     }, true);
     card.addEventListener("pointerdown", (event) => {
-      if (event.button !== 0 || state.selectMode || state.selected.size) return;
+      if (event.pointerType === "touch" || event.button !== 0 || state.selectMode || state.selected.size) return;
       clearActiveDrag();
-      const drag = activeDrag = { card, pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, dragging: false, ghost: null };
+      const drag = activeDrag = { card, input: "pointer", pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, dragging: false, ghost: null };
       drag.timer = setTimeout(() => {
-        if (activeDrag !== drag) return;
-        drag.dragging = true; $("folder-drop-zone").hidden = false; card.classList.add("dragging");
-        drag.ghost = card.cloneNode(true); drag.ghost.classList.add("drag-ghost"); document.body.appendChild(drag.ghost);
-        tg?.HapticFeedback?.impactOccurred?.("light");
+        beginDrag(drag, drag.startX, drag.startY);
       }, 420);
     });
-    card.addEventListener("pointercancel", clearActiveDrag);
+    card.addEventListener("pointercancel", (event) => {
+      if (activeDrag?.input === "pointer" && activeDrag.pointerId === event.pointerId) clearActiveDrag();
+    });
+    card.addEventListener("touchstart", (event) => {
+      if (event.touches.length !== 1 || state.selectMode || state.selected.size) return;
+      clearActiveDrag();
+      const touch = event.changedTouches[0];
+      const drag = activeDrag = { card, input: "touch", touchId: touch.identifier, startX: touch.clientX, startY: touch.clientY, dragging: false, ghost: null };
+      drag.timer = setTimeout(() => beginDrag(drag, drag.startX, drag.startY), 460);
+    }, { passive: true });
   }
   document.addEventListener("pointermove", (event) => {
     const drag = activeDrag;
-    if (!drag || drag.pointerId !== event.pointerId) return;
-    if (!drag.dragging && Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) > 18) { clearTimeout(drag.timer); drag.timer = null; return; }
+    if (!drag || drag.input !== "pointer" || drag.pointerId !== event.pointerId) return;
+    if (!drag.dragging && Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) > 18) { clearActiveDrag(); return; }
     if (!drag.dragging) return;
     if (event.cancelable) event.preventDefault();
-    if (drag.ghost) { drag.ghost.style.left = `${event.clientX + 14}px`; drag.ghost.style.top = `${event.clientY + 14}px`; }
-    const targets = $("folder-drop-targets");
-    targets.querySelectorAll(".drop-hover").forEach((node) => node.classList.remove("drop-hover"));
-    document.elementFromPoint(event.clientX, event.clientY)?.closest(".folder-drop-target")?.classList.add("drop-hover");
+    moveDrag(event.clientX, event.clientY);
   }, { passive: false });
   document.addEventListener("pointerup", (event) => {
     const drag = activeDrag;
-    if (!drag || drag.pointerId !== event.pointerId) return;
-    const folder = drag.dragging ? document.elementFromPoint(event.clientX, event.clientY)?.closest(".folder-drop-target") : null;
-    const folderId = folder ? Number(folder.dataset.folderId) : null;
-    if (drag.dragging) drag.card.dataset.suppressClick = "1";
-    const itemId = Number(drag.card.dataset.id);
-    clearActiveDrag();
-    if (folderId) moveOneToFolder(itemId, folderId);
+    if (!drag || drag.input !== "pointer" || drag.pointerId !== event.pointerId) return;
+    finishDrag(event.clientX, event.clientY);
   });
+  document.addEventListener("touchmove", (event) => {
+    const drag = activeDrag;
+    if (!drag || drag.input !== "touch") return;
+    const touch = Array.from(event.changedTouches).find((item) => item.identifier === drag.touchId);
+    if (!touch) return;
+    if (!drag.dragging) {
+      if (Math.hypot(touch.clientX - drag.startX, touch.clientY - drag.startY) > 18) clearActiveDrag();
+      return;
+    }
+    if (event.cancelable) event.preventDefault();
+    moveDrag(touch.clientX, touch.clientY);
+  }, { passive: false });
+  document.addEventListener("touchend", (event) => {
+    const drag = activeDrag;
+    if (!drag || drag.input !== "touch") return;
+    const touch = Array.from(event.changedTouches).find((item) => item.identifier === drag.touchId);
+    if (touch) finishDrag(touch.clientX, touch.clientY);
+  });
+  document.addEventListener("touchcancel", (event) => {
+    const drag = activeDrag;
+    if (drag?.input === "touch" && Array.from(event.changedTouches).some((item) => item.identifier === drag.touchId)) clearActiveDrag();
+  });
+  $("cancel-drag").addEventListener("click", clearActiveDrag);
 
   $("select-mode").addEventListener("click", () => {
     state.selectMode = !state.selectMode;
@@ -273,9 +325,10 @@
   $("clear-selection").addEventListener("click", () => { state.selected.clear(); state.selectMode = false; renderItems(state.currentItems); updateSelectionBar(); });
   $("selection-bar").addEventListener("click", (event) => { const button = event.target.closest("button[data-action]"); if (button) showAction(button.dataset.action); });
   $("folder-drop-targets").addEventListener("click", (event) => {
+    if (Date.now() < suppressDropClickUntil) { suppressDropClickUntil = 0; event.preventDefault(); event.stopImmediatePropagation(); return; }
     const target = event.target.closest(".folder-drop-target");
     if (target) { $("folder-filter").value = target.dataset.folderId; $("folder-drop-zone").hidden = true; filtersChanged(); }
-  });
+  }, true);
   $("create-folder").addEventListener("click", () => { $("folder-dialog").showModal(); $("folder-form").elements.name.focus(); });
   $("folder-form").querySelector("[data-cancel]").addEventListener("click", () => $("folder-dialog").close());
   $("folder-form").addEventListener("submit", async (event) => {
