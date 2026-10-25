@@ -331,7 +331,7 @@ class MiniAppService:
         try:
             select_sql = f"""SELECT i.id, i.kind, i.content, i.tag, i.manual_tag, i.file_name,
                                i.file_size, i.media_type, i.sender_name, i.source_chat_title, i.created_at,
-                               i.sender_username, i.link_domain, i.mime_type, i.duration, i.width, i.height,
+                               i.sender_username, i.is_forwarded, i.link_domain, i.mime_type, i.duration, i.width, i.height,
                                i.item_state, i.is_favorite, i.context_text, i.telegram_file_id,
                                i.link_url, i.page_title, f.name AS folder_name, f.emoji AS folder_emoji
                         FROM vault_items i JOIN vault_folders f ON f.id = i.folder_id
@@ -400,7 +400,7 @@ class MiniAppService:
             row = conn.execute(
                 """SELECT i.id, i.kind, i.content, i.tag, i.manual_tag, i.file_name,
                           i.file_size, i.media_type, i.mime_type, i.duration, i.width, i.height,
-                          i.sender_name, i.sender_username, i.source_chat_title, i.created_at,
+                          i.sender_name, i.sender_username, i.is_forwarded, i.source_chat_title, i.created_at,
                           i.item_state, i.is_favorite, i.context_text, i.telegram_file_id,
                           i.link_url, i.page_title, i.link_domain,
                           f.name AS folder_name, f.emoji AS folder_emoji

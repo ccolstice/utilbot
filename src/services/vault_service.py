@@ -214,6 +214,7 @@ class VaultService:
         processing_completed_at: str | None = None,
         sender_name: str | None = None,
         sender_username: str | None = None,
+        is_forwarded: bool = False,
         source_chat_title: str | None = None,
         source_chat_id: int | None = None,
         source_message_id: int | None = None,
@@ -238,7 +239,7 @@ class VaultService:
         tag = VaultService._normalize_tags(tag, content, transcript_text, file_name)
 
         conn = get_connection()
-        conn.execute(
+        cursor = conn.execute(
             """
             INSERT INTO vault_items (
                 user_id,
@@ -258,6 +259,7 @@ class VaultService:
                 processing_completed_at,
                 sender_name,
                 sender_username,
+                is_forwarded,
                 source_chat_title,
                 source_chat_id,
                 source_message_id,
@@ -275,7 +277,7 @@ class VaultService:
                 is_favorite,
                 favorited_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 user_id,
@@ -295,6 +297,7 @@ class VaultService:
                 processing_completed_at,
                 sender_name,
                 sender_username,
+                int(is_forwarded),
                 source_chat_title,
                 source_chat_id,
                 source_message_id,
@@ -314,8 +317,22 @@ class VaultService:
             ),
         )
         conn.commit()
-        cur = conn.execute("SELECT last_insert_rowid() AS id")
-        item_id = int(cur.fetchone()["id"])
+        item_id = None
+        if archive_chat_id is not None and archive_message_id is not None:
+            inserted = conn.execute(
+                "SELECT id FROM vault_items WHERE user_id = ? AND archive_chat_id = ? AND archive_message_id = ? ORDER BY id DESC LIMIT 1",
+                (user_id, archive_chat_id, archive_message_id),
+            ).fetchone()
+            item_id = inserted["id"] if inserted else None
+        if not item_id:
+            item_id = cursor.lastrowid
+        if not item_id:
+            inserted = conn.execute("SELECT last_insert_rowid() AS id").fetchone()
+            item_id = inserted["id"] if inserted else None
+        if item_id is None:
+            conn.close()
+            raise RuntimeError("Database did not return the ID of the saved archive item")
+        item_id = int(item_id)
         conn.close()
         return item_id
 
