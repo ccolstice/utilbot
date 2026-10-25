@@ -15,6 +15,7 @@ from typing import Any
 from contextlib import suppress
 
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart, Filter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -277,6 +278,11 @@ def _preview_row(row) -> str:
     return "📝 Текст"
 
 
+def _attribution_label(row) -> str:
+    sender = row["sender_name"] or "Unknown"
+    return f"↪️ Переслано от {sender}" if row["is_forwarded"] else f"👤 {sender}"
+
+
 
 async def _send_text(target, text: str, reply_markup=None):
     await render_menu_panel(target, text, reply_markup=reply_markup)
@@ -521,6 +527,7 @@ async def _save_text_payload(
     tag: str | None = None,
     sender_name: str | None = None,
     sender_username: str | None = None,
+    is_forwarded: bool = False,
     source_chat_title: str | None = None,
     source_chat_id: int | None = None,
     source_message_id: int | None = None,
@@ -547,6 +554,7 @@ async def _save_text_payload(
         dedupe_key=dedupe_key,
         sender_name=sender_name,
         sender_username=sender_username,
+        is_forwarded=is_forwarded,
         source_chat_title=source_chat_title,
         source_chat_id=source_chat_id,
         source_message_id=source_message_id,
@@ -593,6 +601,30 @@ def _message_attribution(message: Message) -> tuple[str | None, str | None, str 
     )
 
 
+async def _archive_message(message: Message, destination_chat_id: int):
+    """Keep Telegram's native forwarded-from label when the source is forwarded."""
+    if getattr(message, "forward_origin", None):
+        try:
+            return await bot.forward_message(
+                chat_id=destination_chat_id,
+                from_chat_id=message.chat.id,
+                message_id=message.message_id,
+            )
+        except TelegramBadRequest:
+            # Protected or otherwise non-forwardable messages can still be copied;
+            # the saved row keeps the sender attribution for the archive card.
+            logging.warning(
+                "Could not preserve native forward header for message %s; falling back to copy",
+                message.message_id,
+                exc_info=True,
+            )
+    return await bot.copy_message(
+        chat_id=destination_chat_id,
+        from_chat_id=message.chat.id,
+        message_id=message.message_id,
+    )
+
+
 def _save_media_payload(
     user_id: int,
     folder_id: int,
@@ -605,6 +637,7 @@ def _save_media_payload(
     dedupe_key: str | None = None,
 ):
     sender_name, sender_username, source_chat_title = _message_attribution(message)
+    is_forwarded = bool(getattr(message, "forward_origin", None))
     source_chat_id = message.chat.id if message.chat else None
     source_message_id = message.message_id
 
@@ -633,6 +666,7 @@ def _save_media_payload(
         voice_duration=payload.duration,
         sender_name=sender_name,
         sender_username=sender_username,
+        is_forwarded=is_forwarded,
         source_chat_title=source_chat_title,
         source_chat_id=source_chat_id,
         source_message_id=source_message_id,
@@ -991,11 +1025,11 @@ async def show_folder_items_page(
 
     visible_index = start + 1
     for row in page_rows:
-        sender = row["sender_name"] or "Unknown"
+        sender = _attribution_label(row)
         dt = _format_dt(row["created_at"])
         text += (
             f"#{visible_index} {_preview_row(row)}\n"
-            f"👤 {sender} • {dt}\n\n"
+            f"{sender} • {dt}\n\n"
         )
         visible_index += 1
 
@@ -1029,12 +1063,12 @@ async def show_all_files_page(target, user_id: int, page: int, *, edit: bool = F
 
     visible_index = start + 1
     for row in page_rows:
-        sender = row["sender_name"] or "Unknown"
+        sender = _attribution_label(row)
         dt = _format_dt(row["created_at"])
         folder_name = folder_map.get(row["folder_id"], "Без папки")
         text += (
             f"#{visible_index} {_preview_row(row)}\n"
-            f"{folder_name} • 👤 {sender} • {dt}\n\n"
+            f"{folder_name} • {sender} • {dt}\n\n"
         )
         visible_index += 1
 
@@ -1070,12 +1104,12 @@ async def show_search_results_page(target, session_id: str, page: int, *, edit: 
     folder_map = {folder["id"]: f"{folder['emoji'] or '📁'} {folder['name']}" for folder in folders}
 
     for row in page_rows:
-        sender = row["sender_name"] or "Unknown"
+        sender = _attribution_label(row)
         dt = _format_dt(row["created_at"])
         folder_name = folder_map.get(row["folder_id"], "Без папки")
         text += (
             f"#{visible_index} {_preview_row(row)}\n"
-            f"{folder_name} • 👤 {sender} • {dt}\n\n"
+            f"{folder_name} • {sender} • {dt}\n\n"
         )
         visible_index += 1
 
@@ -1110,7 +1144,7 @@ async def show_item_view(
 
     folder = VaultService.get_folder_by_id(user_id=user_id, folder_id=row["folder_id"])
     folder_name = f"{folder['emoji'] or '📁'} {folder['name']}" if folder else "Без папки"
-    sender = row["sender_name"] or "Unknown"
+    attribution = _attribution_label(row)
     dt = _format_dt(row["created_at"])
     tag = row["tag"] or "—"
 
@@ -1183,7 +1217,7 @@ async def show_item_view(
     }
     content = row["content"] or ""
     header = (
-        f"{folder_name}\n👤 {sender}\n🕒 {dt}\n🏷 {tag}\n"
+        f"{folder_name}\n{attribution}\n🕒 {dt}\n🏷 {tag}\n"
         f"#{item_id} · {kind_labels.get(row['kind'], row['kind'].title())}"
     )
     if origin == "review":
@@ -1969,11 +2003,7 @@ async def save_folder_handler(callback: CallbackQuery, state: FSMContext):
             return
 
         try:
-            archived = await bot.copy_message(
-                chat_id=callback.message.chat.id,
-                from_chat_id=replied.chat.id,
-                message_id=replied.message_id,
-            )
+            archived = await _archive_message(replied, callback.message.chat.id)
         except Exception:
             logging.exception("Could not archive a media item in the bot chat")
             await callback.answer("Не получилось создать копию записи в этом чате", show_alert=True)
@@ -2915,11 +2945,7 @@ async def _capture_incoming_message_locked(message: Message, state: FSMContext):
     archive = None
     item_id = None
     try:
-        archive = await bot.copy_message(
-            chat_id=message.chat.id,
-            from_chat_id=message.chat.id,
-            message_id=message.message_id,
-        )
+        archive = await _archive_message(message, message.chat.id)
         folder = VaultService.get_or_create_default_folder(message.from_user.id)
         if payload.kind == "text":
             sender_name, sender_username, source_chat_title = _message_attribution(message)
@@ -2929,6 +2955,7 @@ async def _capture_incoming_message_locked(message: Message, state: FSMContext):
                 text=payload.content or "",
                 sender_name=sender_name,
                 sender_username=sender_username,
+                is_forwarded=bool(getattr(message, "forward_origin", None)),
                 source_chat_title=source_chat_title,
                 source_chat_id=message.chat.id,
                 source_message_id=message.message_id,

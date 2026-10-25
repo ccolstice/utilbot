@@ -244,7 +244,7 @@
     const text = item.content || item.link_url || item.file_name || "";
     $("detail-content").dataset.itemId = item.id;
     $("detail-content").innerHTML = `${media}${mediaExpand}<h2 class="detail-title">${escapeHtml(titleFor(item))}</h2>
-      <div class="detail-meta">${escapeHtml(item.folder_emoji || "📁")} ${escapeHtml(item.folder_name)} · ${escapeHtml(stateLabels[item.item_state] || item.item_state)} · ${escapeHtml(displayDate(item.created_at))}${item.sender_name ? ` · ${escapeHtml(item.sender_name)}` : ""}</div>
+      <div class="detail-meta">${escapeHtml(item.folder_emoji || "📁")} ${escapeHtml(item.folder_name)} · ${escapeHtml(stateLabels[item.item_state] || item.item_state)} · ${escapeHtml(displayDate(item.created_at))}${item.sender_name ? ` · ${item.is_forwarded ? "↪️ Переслано от " : ""}${escapeHtml(item.sender_name)}` : ""}</div>
       ${tags ? `<div class="tag-list detail-tags">${tags}</div>` : ""}
       ${text ? `<div class="detail-text">${escapeHtml(text)}</div>` : ""}
       ${item.context_text ? `<h3>Контекст</h3><div class="detail-text">${escapeHtml(item.context_text)}</div>` : ""}

@@ -162,6 +162,7 @@ def init_db():
         processing_completed_at TIMESTAMP DEFAULT NULL,
         sender_name TEXT,
         sender_username TEXT,
+        is_forwarded INTEGER NOT NULL DEFAULT 0,
         source_chat_title TEXT,
         source_chat_id INTEGER,
         source_message_id INTEGER,
@@ -280,6 +281,7 @@ def init_db():
     _ensure_column(conn, "rss_entries", "notified INTEGER NOT NULL DEFAULT 0")
     _ensure_column(conn, "vault_items", "sender_name TEXT")
     _ensure_column(conn, "vault_items", "sender_username TEXT")
+    _ensure_column(conn, "vault_items", "is_forwarded INTEGER NOT NULL DEFAULT 0")
     _ensure_column(conn, "vault_items", "source_chat_title TEXT")
     _ensure_column(conn, "vault_items", "source_chat_id INTEGER")
     _ensure_column(conn, "vault_items", "source_message_id INTEGER")
