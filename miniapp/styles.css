@@ -94,6 +94,10 @@ body.selecting .selection-check { display: grid; }
 .detail-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; margin-top: 16px; }
 .detail-actions button { min-width: 0; padding: 11px 8px; border: 1px solid var(--line); border-radius: 11px; background: var(--bg); color: var(--text); font-size: 12px; font-weight: 700; }
 .detail-actions .danger-action { color: var(--danger); }
+.ocr-result { margin-top: 14px; padding: 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--bg); }
+.ocr-result-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+.ocr-result-heading button { padding: 7px 10px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface); color: var(--text); font-weight: 700; }
+.ocr-result pre { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; font: inherit; }
 .folder-drop-zone { position: sticky; top: 0; z-index: 4; margin: -5px 0 14px; padding: 10px; border: 1px solid color-mix(in srgb, var(--accent) 42%, transparent); border-radius: 14px; background: color-mix(in srgb, var(--surface) 95%, transparent); backdrop-filter: blur(14px); box-shadow: 0 8px 22px #0003; }
 .folder-drop-zone[hidden] { display: none; }
 .drop-zone-hint { display: block; margin: 0 0 8px 2px; color: var(--muted); font-size: 11px; }

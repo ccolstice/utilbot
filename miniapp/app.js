@@ -249,6 +249,7 @@
       ${text ? `<div class="detail-text">${escapeHtml(text)}</div>` : ""}
       ${item.context_text ? `<h3>Контекст</h3><div class="detail-text">${escapeHtml(item.context_text)}</div>` : ""}
       <div class="detail-actions">
+        ${item.ocr_available ? '<button type="button" data-item-action="ocr">🔎 Расшифровать картинку</button>' : ""}
         <button type="button" data-item-action="move">📁 Переместить</button><button type="button" data-item-action="tag">🏷 Тег</button>
         <button type="button" data-item-action="state">↔ Статус</button><button type="button" data-item-action="favorite">⭐ ${item.is_favorite ? "Убрать из избранного" : "В избранное"}</button>
         <button type="button" data-item-action="remind">⏰ Напомнить</button>
@@ -263,7 +264,8 @@
       if (mediaNode.load) mediaNode.load();
     }).catch(() => { if (mediaNode.isConnected) mediaNode.replaceWith(Object.assign(document.createElement("p"), { className: "action-note", textContent: "Не удалось открыть файл. Попробуй открыть его в Telegram." })); });
     $("detail-content").querySelectorAll("[data-item-action]").forEach((button) => button.addEventListener("click", () => {
-      if (button.dataset.itemAction === "remind") openReminderForm(item);
+      if (button.dataset.itemAction === "ocr") transcribePhoto(item, button);
+      else if (button.dataset.itemAction === "remind") openReminderForm(item);
       else showAction(button.dataset.itemAction, [item.id], !item.is_favorite);
     }));
     const imageNode = $("detail-content").querySelector("img[data-preview], img[data-media]");
@@ -282,6 +284,34 @@
         else video?.play();
       }
     });
+  }
+
+  async function transcribePhoto(item, button) {
+    const container = $("detail-content");
+    let result = container.querySelector(".ocr-result");
+    if (!result) {
+      result = document.createElement("section");
+      result.className = "ocr-result";
+      result.innerHTML = '<div class="ocr-result-heading"><strong>Распознанный текст</strong><button type="button" data-ocr-copy>Копировать</button></div><pre data-ocr-text></pre>';
+      container.append(result);
+      result.querySelector("[data-ocr-copy]").addEventListener("click", async () => {
+        const text = result.querySelector("[data-ocr-text]").textContent;
+        try { await navigator.clipboard.writeText(text); toast("Текст скопирован"); }
+        catch { toast("Не удалось скопировать текст"); }
+      });
+    }
+    result.hidden = false;
+    result.querySelector("[data-ocr-text]").textContent = "Распознаю…";
+    button.disabled = true;
+    button.textContent = "⏳ Распознаю…";
+    try {
+      const data = await api(`/api/miniapp/items/${item.id}/ocr`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+      result.querySelector("[data-ocr-text]").textContent = data.text;
+    } catch (error) {
+      result.querySelector("[data-ocr-text]").textContent = error.message || "Не удалось распознать текст.";
+    } finally {
+      if (button.isConnected) { button.disabled = false; button.textContent = "🔎 Расшифровать картинку"; }
+    }
   }
 
   function showAction(action, overrideIds = null, favoriteValue = null) {

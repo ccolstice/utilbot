@@ -19,7 +19,8 @@ from src.db.database import DATABASE_BACKEND, get_connection
 from src.services.tag_service import format_tags, merge_user_tags
 from src.services.reminder_service import ReminderService
 from src.services.vault_service import VaultService
-from src.utils.filters import is_allowed_user
+from src.utils.filters import is_allowed_user, is_owner_user
+from src.services.chatgpt_ocr_service import ChatGptOcrService
 
 logger = logging.getLogger(__name__)
 MINI_APP_DIR = Path(__file__).resolve().parents[2] / "miniapp"
@@ -49,6 +50,7 @@ class MiniAppService:
         app.router.add_get("/api/miniapp/items/{item_id:\\d+}/media-link", self.media_link)
         app.router.add_post("/api/miniapp/items/bulk", self.bulk_action)
         app.router.add_get("/api/miniapp/items/{item_id:\\d+}/preview", self.photo_preview)
+        app.router.add_post("/api/miniapp/items/{item_id:\\d+}/ocr", self.transcribe_photo)
         app.router.add_get("/api/miniapp/media/{user_id:\\d+}/{item_id:\\d+}", self.stream_media)
         app.router.add_get("/api/miniapp/reminders", self.list_reminders)
         app.router.add_post("/api/miniapp/reminders", self.create_reminder)
@@ -385,6 +387,8 @@ class MiniAppService:
             item["context_text"] = (item["context_text"] or "")[:1200]
             item["is_favorite"] = bool(item["is_favorite"])
             item["preview_url"] = f"/api/miniapp/items/{item['id']}/preview" if has_photo else None
+            is_image = has_photo or (item["kind"] == "document" and item.get("mime_type") in {"image/jpeg", "image/png", "image/webp"})
+            item["ocr_available"] = bool(is_image and is_owner_user(user_id, self.settings) and self.settings.chatgpt_ocr_url and self.settings.chatgpt_ocr_token)
             item["has_media"] = bool(item.get("telegram_file_id"))
             items.append(item)
         return web.json_response(
@@ -416,6 +420,8 @@ class MiniAppService:
         has_photo = item["kind"] == "photo" and bool(item["telegram_file_id"])
         item["has_media"] = bool(item["telegram_file_id"])
         item["preview_url"] = f"/api/miniapp/items/{item_id}/preview" if has_photo else None
+        is_image = has_photo or (item["kind"] == "document" and item.get("mime_type") in {"image/jpeg", "image/png", "image/webp"})
+        item["ocr_available"] = bool(is_image and is_owner_user(user_id, self.settings) and self.settings.chatgpt_ocr_url and self.settings.chatgpt_ocr_token)
         item["content"] = (item["content"] or "")[:1800]
         item["context_text"] = (item["context_text"] or "")[:1200]
         item["is_favorite"] = bool(item["is_favorite"])
@@ -551,7 +557,7 @@ class MiniAppService:
         conn = get_connection()
         try:
             row = conn.execute(
-                "SELECT telegram_file_id, kind FROM vault_items WHERE user_id = ? AND id = ?",
+                "SELECT telegram_file_id, kind, mime_type FROM vault_items WHERE user_id = ? AND id = ?",
                 (user_id, item_id),
             ).fetchone()
         finally:
@@ -591,6 +597,32 @@ class MiniAppService:
                 type(exc).__name__,
             )
             raise web.HTTPBadGateway(text="Не удалось загрузить фото из Telegram.")
+
+    async def transcribe_photo(self, request: web.Request) -> web.Response:
+        user_id = self._authenticated_user_id(request)
+        if not is_owner_user(user_id, self.settings):
+            raise web.HTTPForbidden(text="Распознавание доступно только владельцу бота.")
+        item_id = int(request.match_info["item_id"])
+        conn = get_connection()
+        try:
+            row = conn.execute(
+                "SELECT telegram_file_id, kind, mime_type FROM vault_items WHERE user_id = ? AND id = ?",
+                (user_id, item_id),
+            ).fetchone()
+        finally:
+            conn.close()
+        if not row or not (row["kind"] == "photo" or (row["kind"] == "document" and row["mime_type"] in {"image/jpeg", "image/png", "image/webp"})) or not row["telegram_file_id"]:
+            raise web.HTTPNotFound(text="Фото не найдено.")
+        try:
+            text = await ChatGptOcrService.transcribe_file(self.bot, self.settings, user_id, row["telegram_file_id"])
+        except ValueError as exc:
+            raise web.HTTPBadRequest(text=str(exc))
+        except RuntimeError as exc:
+            raise web.HTTPBadGateway(text=str(exc))
+        except Exception as exc:
+            logger.warning("Mini App OCR failed for user=%s item=%s (%s)", user_id, item_id, type(exc).__name__)
+            raise web.HTTPBadGateway(text="Не удалось распознать текст. Попробуй ещё раз.")
+        return web.json_response({"text": text}, headers={"Cache-Control": "no-store"})
 
     async def media_link(self, request: web.Request) -> web.Response:
         user_id = self._authenticated_user_id(request)

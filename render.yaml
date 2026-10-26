@@ -13,6 +13,12 @@ services:
         sync: false
       - key: OWNER_USER_IDS
         sync: false
+      - key: ARCHIVE_API_TOKEN
+        sync: false
+      - key: CHATGPT_OCR_URL
+        sync: false
+      - key: CHATGPT_OCR_TOKEN
+        sync: false
       - key: RENDER_FREE_MODE
         value: "1"
       - key: ENABLE_FILE_LOG
