@@ -13,8 +13,6 @@ services:
         sync: false
       - key: OWNER_USER_IDS
         sync: false
-      - key: ARCHIVE_API_TOKEN
-        sync: false
       - key: CHATGPT_OCR_URL
         sync: false
       - key: CHATGPT_OCR_TOKEN

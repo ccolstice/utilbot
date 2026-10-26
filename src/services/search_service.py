@@ -1,57 +1,21 @@
 from __future__ import annotations
 
-import re
-
 from src.services.vault_service import VaultService
 from src.utils.search_parser import parse_search_request
-
-
-_WORD_RE = re.compile(r"[^\W_]+", re.UNICODE)
-_STOP_WORDS = {
-    "а", "без", "бы", "был", "была", "были", "быть", "в", "вам", "вас", "во",
-    "вот", "все", "всё", "для", "до", "его", "ее", "её", "если", "есть", "же",
-    "за", "и", "из", "или", "к", "как", "ко", "мне", "мы", "на", "над", "не",
-    "него", "нее", "неё", "нет", "ни", "но", "о", "об", "от", "по", "под",
-    "при", "про", "с", "со", "то", "у", "уже", "что", "это", "этот", "эта",
-    "эти", "я",
-}
 
 
 def _searchable_blob(row) -> str:
     parts = [
         row["title"] if "title" in row.keys() else None,
         row["content"] if "content" in row.keys() else None,
-        row["context_text"] if "context_text" in row.keys() else None,
         row["tag"] if "tag" in row.keys() else None,
-        row["manual_tag"] if "manual_tag" in row.keys() else None,
         row["transcript_text"] if "transcript_text" in row.keys() else None,
         row["file_name"] if "file_name" in row.keys() else None,
-        row["page_title"] if "page_title" in row.keys() else None,
-        row["link_url"] if "link_url" in row.keys() else None,
-        row["link_domain"] if "link_domain" in row.keys() else None,
         row["sender_name"] if "sender_name" in row.keys() else None,
-        row["sender_username"] if "sender_username" in row.keys() else None,
         row["source_chat_title"] if "source_chat_title" in row.keys() else None,
         row["mime_type"] if "mime_type" in row.keys() else None,
     ]
     return " ".join(str(part) for part in parts if part)
-
-
-def _search_score(row, query_terms: list[str], normalized_query: str) -> int:
-    blob = " ".join(_searchable_blob(row).casefold().split())
-    words = set(_WORD_RE.findall(blob))
-    score = 0
-    for term in query_terms:
-        if term in words:
-            score += 3
-        elif any(len(term) >= 4 and word.startswith(term) or len(word) >= 4 and term.startswith(word) for word in words):
-            # Russian inflections often change a word ending (e.g. "файл" / "файлы").
-            score += 2
-        elif term in blob:
-            score += 1
-    if normalized_query and normalized_query in blob:
-        score += 5
-    return score
 
 
 class SearchService:
@@ -126,21 +90,15 @@ class SearchService:
 
         if query:
             normalized_query = " ".join(query.casefold().split())
-            query_terms = [
-                term for term in dict.fromkeys(_WORD_RE.findall(normalized_query))
-                if term not in _STOP_WORDS and len(term) > 1
-            ]
-            # Natural-language archive questions need recall: the model may
-            # paraphrase the stored text, and Russian word endings can differ.
-            # Rank partial matches above unrelated recent items instead of
-            # requiring every query word to appear verbatim.
-            scored = [
-                (self_score, row)
-                for row in rows
-                if (self_score := _search_score(row, query_terms, normalized_query)) > 0
-            ]
-            scored.sort(key=lambda item: (item[0], int(item[1]["id"])), reverse=True)
-            rows = [row for _, row in scored]
+            query_terms = normalized_query.split()
+            matches = []
+            for row in rows:
+                blob = " ".join(_searchable_blob(row).casefold().split())
+                if all(term in blob for term in query_terms):
+                    matches.append(row)
+            # Prefer the most recently saved exact matches. No fuzzy low-score
+            # matches: they made unrelated items appear for short queries.
+            rows = sorted(matches, key=lambda row: int(row["id"]), reverse=True)
         else:
             rows = list(rows)
 
