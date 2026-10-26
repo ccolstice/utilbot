@@ -49,7 +49,6 @@ class Settings:
     enable_file_log: bool
     render_free_mode: bool
     backup_interval_hours: int
-    archive_api_token: str
     chatgpt_ocr_url: str
     chatgpt_ocr_token: str
 
@@ -89,7 +88,6 @@ def get_settings() -> Settings:
         enable_file_log=_env_bool("ENABLE_FILE_LOG", "0"),
         render_free_mode=render_free_mode,
         backup_interval_hours=max(24, min(_env_int("BACKUP_INTERVAL_HOURS", 24), 48)),
-        archive_api_token=os.getenv("ARCHIVE_API_TOKEN", "").strip(),
         chatgpt_ocr_url=chatgpt_ocr_url,
         chatgpt_ocr_token=chatgpt_ocr_token,
     )
