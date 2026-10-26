@@ -49,6 +49,9 @@ class Settings:
     enable_file_log: bool
     render_free_mode: bool
     backup_interval_hours: int
+    archive_api_token: str
+    chatgpt_ocr_url: str
+    chatgpt_ocr_token: str
 
 
 def get_settings() -> Settings:
@@ -63,6 +66,12 @@ def get_settings() -> Settings:
     render_free_mode = _env_bool("RENDER_FREE_MODE", "0")
     allowed_user_ids = _parse_ids(os.getenv("ALLOWED_USER_IDS"))
     owner_user_ids = _parse_ids(os.getenv("OWNER_USER_IDS"))
+    chatgpt_ocr_url = os.getenv("CHATGPT_OCR_URL", "").strip().rstrip("/")
+    chatgpt_ocr_token = os.getenv("CHATGPT_OCR_TOKEN", "").strip()
+    if bool(chatgpt_ocr_url) != bool(chatgpt_ocr_token):
+        raise RuntimeError("Set both CHATGPT_OCR_URL and CHATGPT_OCR_TOKEN to enable OCR.")
+    if chatgpt_ocr_url and not chatgpt_ocr_url.startswith("https://"):
+        raise RuntimeError("CHATGPT_OCR_URL must use HTTPS.")
 
     if render_free_mode and not allowed_user_ids and not owner_user_ids:
         raise RuntimeError(
@@ -80,4 +89,7 @@ def get_settings() -> Settings:
         enable_file_log=_env_bool("ENABLE_FILE_LOG", "0"),
         render_free_mode=render_free_mode,
         backup_interval_hours=max(24, min(_env_int("BACKUP_INTERVAL_HOURS", 24), 48)),
+        archive_api_token=os.getenv("ARCHIVE_API_TOKEN", "").strip(),
+        chatgpt_ocr_url=chatgpt_ocr_url,
+        chatgpt_ocr_token=chatgpt_ocr_token,
     )

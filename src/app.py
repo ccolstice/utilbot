@@ -72,6 +72,7 @@ from src.services.google_drive_service import GoogleDriveService
 from src.services.health_server import HealthServer
 from src.services.index_service import IndexService
 from src.services.media_service import MediaService
+from src.services.chatgpt_ocr_service import ChatGptOcrService
 from src.services.link_service import LinkService
 from src.services.rss_service import RSSService
 from src.states.save_state import SaveStates
@@ -1205,6 +1206,12 @@ async def show_item_view(
         delete_callback=delete_callback,
         review_next_callback=f"review_skip_{item_id}" if origin == "review" else None,
         review_move_callback=move_callback if origin == "review" else None,
+        ocr_callback=(
+            f"item_ocr_{item_id}"
+            if (row["kind"] == "photo" or (row["kind"] == "document" and row["mime_type"] in {"image/jpeg", "image/png", "image/webp"}))
+            and _is_owner(user_id) and settings.chatgpt_ocr_url and settings.chatgpt_ocr_token
+            else None
+        ),
     )
     current_state = row["item_state"] if "item_state" in row.keys() else "saved"
     markup.inline_keyboard.insert(0, item_state_buttons(item_id, current_state))
@@ -1251,6 +1258,32 @@ async def show_item_view(
     if answer_callback and isinstance(target, CallbackQuery):
         await target.answer()
     return
+
+
+@dp.callback_query(F.data.regexp(r"^item_ocr_\d+$"))
+async def item_ocr_handler(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    if not _is_owner(user_id):
+        await callback.answer("Доступно только владельцу бота", show_alert=True)
+        return
+    if not callback.message or callback.message.chat.type != "private":
+        await callback.answer("Открой фото в личном чате с ботом", show_alert=True)
+        return
+    item_id = int(callback.data.rsplit("_", 1)[1])
+    item = VaultService.get_item(user_id, item_id)
+    if not item or not (item["kind"] == "photo" or (item["kind"] == "document" and item["mime_type"] in {"image/jpeg", "image/png", "image/webp"})) or not item["telegram_file_id"]:
+        await callback.answer("Фото не найдено", show_alert=True)
+        return
+    await callback.answer("Распознаю текст…")
+    try:
+        text = await ChatGptOcrService.transcribe_file(bot, settings, user_id, item["telegram_file_id"])
+    except Exception as exc:
+        logging.warning("OCR failed for owner=%s item=%s (%s)", user_id, item_id, type(exc).__name__)
+        message = str(exc).strip() or "Не удалось распознать текст. Попробуй ещё раз."
+        await callback.message.answer(message[:3900])
+        return
+    for part in (text[i:i + 3900] for i in range(0, len(text), 3900)):
+        await callback.message.answer(part)
 
 
 def _saved_item_view_state(user_id: int, item_id: int) -> dict[str, Any] | None:
