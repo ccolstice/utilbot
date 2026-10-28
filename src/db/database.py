@@ -149,6 +149,12 @@ def init_db():
         folder_id INTEGER NOT NULL,
         kind TEXT NOT NULL DEFAULT 'text',
         content TEXT,
+        ai_description TEXT,
+        ai_tags TEXT,
+        ai_previous_description TEXT,
+        ai_previous_tags TEXT,
+        ai_previous_ai_tags TEXT,
+        ai_analysis_active INTEGER NOT NULL DEFAULT 0,
         tag TEXT,
         telegram_file_id TEXT,
         archive_chat_id INTEGER,
@@ -293,6 +299,12 @@ def init_db():
     _ensure_column(conn, "vault_items", "duration INTEGER")
     _ensure_column(conn, "vault_items", "media_type TEXT")
     _ensure_column(conn, "vault_items", "manual_tag TEXT")
+    _ensure_column(conn, "vault_items", "ai_description TEXT")
+    _ensure_column(conn, "vault_items", "ai_tags TEXT")
+    _ensure_column(conn, "vault_items", "ai_previous_description TEXT")
+    _ensure_column(conn, "vault_items", "ai_previous_tags TEXT")
+    _ensure_column(conn, "vault_items", "ai_previous_ai_tags TEXT")
+    _ensure_column(conn, "vault_items", "ai_analysis_active INTEGER NOT NULL DEFAULT 0")
     _ensure_column(conn, "vault_items", "link_url TEXT")
     _ensure_column(conn, "vault_items", "link_domain TEXT")
     _ensure_column(conn, "vault_items", "page_title TEXT")

@@ -16,6 +16,7 @@
 - Мини‑приложение обслуживается тем же Web Service по `/miniapp/` и использует тот же SQLite‑каталог. Render автоматически передаёт публичный HTTPS‑адрес через `RENDER_EXTERNAL_URL`; отдельный сервис, домен или платный план не нужны.
 - Для уже созданного Web Service используй Docker runtime и запусти deploy. Сохрани `BOT_TOKEN`, `ALLOWED_USER_IDS`, `OWNER_USER_IDS`, `RENDER_FREE_MODE`, `DATABASE_PATH`, `HOST`.
 - `DATABASE_PATH` указывает на SQLite-файл. В бесплатном Web Service файловая система временная: Render стирает SQLite при redeploy, перезапуске и spin-down. UptimeRobot не делает диск постоянным. Для сохранения данных между деплоями нужен платный compute и Persistent Disk, см. инструкцию ниже.
+- Для AI-обработки сохранённых материалов задай `CHATGPT_AI_URL=https://tgshoppe.onrender.com/internal/utilbot/process` и `CHATGPT_AI_TOKEN`. В SIWC-сервисе `tgshoppe` задай `UTILBOT_AI_TOKEN` с тем же секретом. После деплоя у владельца в карточке будет кнопка обработки; ChatGPT заменяет AI-описание и теги, а кнопки «Попробовать ещё» и «Отменить анализ» позволяют повторить результат или восстановить описание/теги до первого анализа.
 - Health endpoint: `/health`. UptimeRobot может раз в несколько минут обращаться к нему, чтобы будить бесплатный Web Service.
 
 ## Как работает архив
