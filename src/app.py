@@ -73,6 +73,7 @@ from src.services.health_server import HealthServer
 from src.services.index_service import IndexService
 from src.services.media_service import MediaService
 from src.services.chatgpt_ocr_service import ChatGptOcrService
+from src.services.chatgpt_ai_service import ChatGptAiService
 from src.services.link_service import LinkService
 from src.services.rss_service import RSSService
 from src.states.save_state import SaveStates
@@ -111,6 +112,7 @@ dp.include_router(capture_router)
 pending_media: dict[int, Message] = {}
 capture_locks: dict[int, asyncio.Lock] = {}
 search_sessions: dict[str, dict[str, Any]] = {}
+ai_processing_items: set[tuple[int, int]] = set()
 health_server: HealthServer | None = None
 backup_recipients: tuple[int, ...] = tuple(sorted(settings.owner_user_ids or settings.allowed_user_ids))
 
@@ -1212,6 +1214,24 @@ async def show_item_view(
             and _is_owner(user_id) and settings.chatgpt_ocr_url and settings.chatgpt_ocr_token
             else None
         ),
+        ai_callback=(
+            f"item_ai_{item_id}"
+            if _is_owner(user_id) and settings.chatgpt_ai_url and settings.chatgpt_ai_token
+            and not row["ai_analysis_active"]
+            else None
+        ),
+        ai_retry_callback=(
+            f"item_ai_retry_{item_id}"
+            if _is_owner(user_id) and settings.chatgpt_ai_url and settings.chatgpt_ai_token
+            and row["ai_analysis_active"]
+            else None
+        ),
+        ai_undo_callback=(
+            f"item_ai_undo_{item_id}"
+            if _is_owner(user_id) and settings.chatgpt_ai_url and settings.chatgpt_ai_token
+            and row["ai_analysis_active"]
+            else None
+        ),
     )
     current_state = row["item_state"] if "item_state" in row.keys() else "saved"
     markup.inline_keyboard.insert(0, item_state_buttons(item_id, current_state))
@@ -1231,6 +1251,8 @@ async def show_item_view(
         header = "⚡ Разбор входящих\n\n" + header
     if row["context_text"]:
         header += "\n\n🗒 Контекст: " + safe_excerpt(row["context_text"], 700)
+    if row["ai_description"]:
+        header += "\n\n✨ Кратко: " + safe_excerpt(row["ai_description"], 900)
     if row["kind"] in media_kinds:
         if content:
             header += "\n\n" + safe_excerpt(content, 1200)
@@ -1284,6 +1306,61 @@ async def item_ocr_handler(callback: CallbackQuery):
         return
     for part in (text[i:i + 3900] for i in range(0, len(text), 3900)):
         await callback.message.answer(part)
+
+
+@dp.callback_query(F.data.regexp(r"^item_ai_(?:(?:retry|undo)_)?\d+$"))
+async def item_ai_handler(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    if not _is_owner(user_id):
+        await callback.answer("Доступно только владельцу бота", show_alert=True)
+        return
+    if not callback.message or callback.message.chat.type != "private":
+        await callback.answer("Открой запись в личном чате с ботом", show_alert=True)
+        return
+    if not settings.chatgpt_ai_url or not settings.chatgpt_ai_token:
+        await callback.answer("AI-обработка пока не настроена", show_alert=True)
+        return
+
+    parts = callback.data.split("_")
+    action = parts[2] if len(parts) == 4 else "process"
+    item_id = int(parts[-1])
+    key = (user_id, item_id)
+    if action == "undo":
+        if key in ai_processing_items:
+            await callback.answer("Сначала дождись окончания обработки", show_alert=True)
+            return
+        restored = VaultService.undo_item_ai_metadata(user_id, item_id)
+        if not restored:
+            await callback.answer("Нет анализа, который можно отменить", show_alert=True)
+            return
+        await callback.answer("Анализ отменён")
+        await _return_to_item_card(callback, user_id, item_id)
+        return
+
+    if key in ai_processing_items:
+        await callback.answer("Эта запись уже обрабатывается")
+        return
+    item = VaultService.get_item(user_id, item_id)
+    if not item:
+        await callback.answer("Запись не найдена", show_alert=True)
+        return
+
+    ai_processing_items.add(key)
+    await callback.answer("Отправляю запись в ChatGPT…" if action == "process" else "Повторно обрабатываю запись…")
+    progress = await callback.message.answer("⏳ Обрабатываю запись: обновляю описание и теги…")
+    try:
+        result = await ChatGptAiService.process_item(bot, settings, user_id, item)
+        updated = VaultService.update_item_ai_metadata(user_id, item_id, result["description"], result["tags"])
+        if not updated:
+            raise RuntimeError("Запись уже удалена.")
+        await progress.delete()
+        await _return_to_item_card(callback, user_id, item_id)
+    except Exception as exc:
+        logging.warning("ChatGPT archive processing failed for owner=%s item=%s (%s)", user_id, item_id, type(exc).__name__)
+        message = str(exc).strip() or "Не удалось обработать запись. Попробуй ещё раз."
+        await progress.edit_text(f"❌ {message[:900]}")
+    finally:
+        ai_processing_items.discard(key)
 
 
 def _saved_item_view_state(user_id: int, item_id: int) -> dict[str, Any] | None:

@@ -584,7 +584,11 @@ class VaultService:
             """
             UPDATE vault_items
             SET tag = ?,
-                manual_tag = ?
+                manual_tag = ?,
+                ai_previous_description = NULL,
+                ai_previous_tags = NULL,
+                ai_previous_ai_tags = NULL,
+                ai_analysis_active = 0
             WHERE user_id = ? AND id = ?
             """,
             (tag, tag, user_id, item_id),
@@ -896,6 +900,75 @@ class VaultService:
             WHERE user_id = ? AND id = ?
             """,
             (tags, tags, user_id, item_id),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM vault_items WHERE user_id = ? AND id = ?",
+            (user_id, item_id),
+        ).fetchone()
+        conn.close()
+        return row
+
+    @staticmethod
+    def update_item_ai_metadata(user_id: int, item_id: int, description: str, tags: list[str]):
+        description = " ".join(str(description or "").split())[:1200]
+        ai_tags = format_tags([str(tag).strip().lstrip("#") for tag in tags if str(tag).strip()])
+        conn = get_connection()
+        existing = conn.execute(
+            "SELECT * FROM vault_items WHERE user_id = ? AND id = ?",
+            (user_id, item_id),
+        ).fetchone()
+        if not existing:
+            conn.close()
+            return None
+
+        # Keep the pre-analysis state across retries so one undo always restores
+        # exactly what the user had before the first successful AI analysis.
+        active = bool(existing["ai_analysis_active"])
+        previous_description = existing["ai_previous_description"] if active else existing["ai_description"]
+        previous_tags = existing["ai_previous_tags"] if active else existing["tag"]
+        previous_ai_tags = existing["ai_previous_ai_tags"] if active else existing["ai_tags"]
+        conn.execute(
+            """
+            UPDATE vault_items SET
+                ai_description = ?, ai_tags = ?, tag = ?,
+                ai_previous_description = ?, ai_previous_tags = ?, ai_previous_ai_tags = ?,
+                ai_analysis_active = 1
+            WHERE user_id = ? AND id = ?
+            """,
+            (description, ai_tags, ai_tags, previous_description, previous_tags, previous_ai_tags, user_id, item_id),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM vault_items WHERE user_id = ? AND id = ?",
+            (user_id, item_id),
+        ).fetchone()
+        conn.close()
+        return row
+
+    @staticmethod
+    def undo_item_ai_metadata(user_id: int, item_id: int):
+        conn = get_connection()
+        existing = conn.execute(
+            "SELECT * FROM vault_items WHERE user_id = ? AND id = ?",
+            (user_id, item_id),
+        ).fetchone()
+        if not existing or not existing["ai_analysis_active"]:
+            conn.close()
+            return None
+        conn.execute(
+            """
+            UPDATE vault_items SET
+                ai_description = ai_previous_description,
+                tag = ai_previous_tags,
+                ai_tags = ai_previous_ai_tags,
+                ai_previous_description = NULL,
+                ai_previous_tags = NULL,
+                ai_previous_ai_tags = NULL,
+                ai_analysis_active = 0
+            WHERE user_id = ? AND id = ?
+            """,
+            (user_id, item_id),
         )
         conn.commit()
         row = conn.execute(

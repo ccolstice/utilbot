@@ -51,6 +51,8 @@ class Settings:
     backup_interval_hours: int
     chatgpt_ocr_url: str
     chatgpt_ocr_token: str
+    chatgpt_ai_url: str
+    chatgpt_ai_token: str
 
 
 def get_settings() -> Settings:
@@ -67,10 +69,16 @@ def get_settings() -> Settings:
     owner_user_ids = _parse_ids(os.getenv("OWNER_USER_IDS"))
     chatgpt_ocr_url = os.getenv("CHATGPT_OCR_URL", "").strip().rstrip("/")
     chatgpt_ocr_token = os.getenv("CHATGPT_OCR_TOKEN", "").strip()
+    chatgpt_ai_url = os.getenv("CHATGPT_AI_URL", "").strip().rstrip("/")
+    chatgpt_ai_token = os.getenv("CHATGPT_AI_TOKEN", "").strip()
     if bool(chatgpt_ocr_url) != bool(chatgpt_ocr_token):
         raise RuntimeError("Set both CHATGPT_OCR_URL and CHATGPT_OCR_TOKEN to enable OCR.")
     if chatgpt_ocr_url and not chatgpt_ocr_url.startswith("https://"):
         raise RuntimeError("CHATGPT_OCR_URL must use HTTPS.")
+    if bool(chatgpt_ai_url) != bool(chatgpt_ai_token):
+        raise RuntimeError("Set both CHATGPT_AI_URL and CHATGPT_AI_TOKEN to enable AI processing.")
+    if chatgpt_ai_url and not chatgpt_ai_url.startswith("https://"):
+        raise RuntimeError("CHATGPT_AI_URL must use HTTPS.")
 
     if render_free_mode and not allowed_user_ids and not owner_user_ids:
         raise RuntimeError(
@@ -90,4 +98,6 @@ def get_settings() -> Settings:
         backup_interval_hours=max(24, min(_env_int("BACKUP_INTERVAL_HOURS", 24), 48)),
         chatgpt_ocr_url=chatgpt_ocr_url,
         chatgpt_ocr_token=chatgpt_ocr_token,
+        chatgpt_ai_url=chatgpt_ai_url,
+        chatgpt_ai_token=chatgpt_ai_token,
     )
