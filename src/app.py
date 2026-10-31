@@ -38,7 +38,6 @@ from aiogram.types import (
     InputMediaPhoto,
     InputMediaVideo,
     InputTextMessageContent,
-    MessageEntity,
     MenuButtonCommands,
     Message,
     ReplyParameters,
@@ -118,8 +117,6 @@ media_group_states: dict[tuple[int, str], FSMContext] = {}
 media_group_tasks: dict[tuple[int, str], asyncio.Task] = {}
 search_sessions: dict[str, dict[str, Any]] = {}
 ai_processing_items: set[tuple[int, int]] = set()
-# Temporary proof-of-concept storage: one custom emoji per Telegram user.
-custom_emoji_inline_test: dict[int, dict[str, Any]] = {}
 health_server: HealthServer | None = None
 backup_recipients: tuple[int, ...] = tuple(sorted(settings.owner_user_ids or settings.allowed_user_ids))
 
@@ -163,22 +160,6 @@ class SaveWordFilter(Filter):
             return False
         text = message.text.casefold().strip(" \t\n\r.,!?:;")
         return text in SAVE_WORDS
-
-
-class CustomEmojiInlineTestFilter(Filter):
-    async def __call__(self, message: Message, state: FSMContext) -> bool:
-        if message.chat.type != "private" or not message.text or await state.get_state() is not None:
-            return False
-        return any(
-            getattr(entity.type, "value", entity.type) == "custom_emoji"
-            and entity.custom_emoji_id
-            for entity in (message.entities or [])
-        )
-
-
-def _utf16_text_slice(text: str, offset: int, length: int) -> str:
-    raw = text.encode("utf-16-le")
-    return raw[offset * 2:(offset + length) * 2].decode("utf-16-le")
 
 
 def _is_owner(user_id: int | None) -> bool:
@@ -1800,79 +1781,10 @@ async def start_handler(message: Message, state: FSMContext):
         await message.answer(text, reply_markup=main_menu_keyboard())
 
 
-@dp.message(CustomEmojiInlineTestFilter())
-async def capture_custom_emoji_for_inline_test(message: Message):
-    entity = next(
-        entity for entity in (message.entities or [])
-        if getattr(entity.type, "value", entity.type) == "custom_emoji" and entity.custom_emoji_id
-    )
-    fallback = _utf16_text_slice(message.text or "", entity.offset, entity.length)
-    custom_emoji_inline_test[message.from_user.id] = {
-        "custom_emoji_id": entity.custom_emoji_id,
-        "fallback": fallback,
-        "length": entity.length,
-    }
-    me = await bot.get_me()
-    await message.answer(
-        "🧪 Получил custom emoji из Telegram-сущности. Сохранил один смайлик только в памяти процесса.\n"
-        f"ID: {entity.custom_emoji_id}\n\n"
-        f"Нажми кнопку и выбери результат. Для проверки в другом чате введи @{me.username} emoji-test.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(
-                text="🧪 Проверить в другом чате",
-                switch_inline_query="emoji-test",
-            )
-        ]]),
-    )
-
-
 @dp.inline_query()
 async def inline_archive_search(inline_query: InlineQuery):
     """Search privately; selecting a cached result sends that saved item into the current chat."""
     query = (inline_query.query or "").strip()
-    if query.casefold().startswith("emoji-test"):
-        sample = custom_emoji_inline_test.get(inline_query.from_user.id)
-        if not sample:
-            await inline_query.answer([InlineQueryResultArticle(
-                id=f"emoji_test_missing_{inline_query.from_user.id}",
-                title="Сначала отправь custom emoji боту",
-                description="Тестовый смайлик хранится только до перезапуска сервиса",
-                input_message_content=InputTextMessageContent(
-                    message_text="Сначала отправь один custom emoji в личный чат Утил-бота, затем повтори emoji-test."
-                ),
-            )], cache_time=0, is_personal=True)
-            return
-        results = [InlineQueryResultArticle(
-            id=f"emoji_text_{inline_query.from_user.id}",
-            title="Текстовый тест (может стать обычным emoji)",
-            description="Проверка custom_emoji сущности в тексте inline-сообщения",
-            input_message_content=InputTextMessageContent(
-                message_text=sample["fallback"],
-                entities=[MessageEntity(
-                    type="custom_emoji",
-                    offset=0,
-                    length=sample["length"],
-                    custom_emoji_id=sample["custom_emoji_id"],
-                )],
-            ),
-        )]
-        fallback_result = InlineQueryResultArticle(
-            id=f"emoji_fallback_{inline_query.from_user.id}",
-            title="⚠️ Только обычный fallback, не исходный emoji",
-            description="Telegram отклонил custom emoji результат; это только диагностика",
-            input_message_content=InputTextMessageContent(message_text=sample["fallback"]),
-        )
-        try:
-            await inline_query.answer(results, cache_time=0, is_personal=True)
-        except TelegramBadRequest:
-            logging.exception("Telegram rejected the custom emoji inline test result")
-            try:
-                await inline_query.answer([fallback_result], cache_time=0, is_personal=True)
-            except TelegramBadRequest:
-                logging.exception("Telegram rejected even the plain fallback inline result")
-                await inline_query.answer([], cache_time=0, is_personal=True)
-        return
-
     direct_match = re.fullmatch(r"item:(\d+)", query, flags=re.IGNORECASE)
     if direct_match:
         row = VaultService.get_item(inline_query.from_user.id, int(direct_match.group(1)))
