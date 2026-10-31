@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 from io import BytesIO
 
 import aiohttp
@@ -38,6 +39,7 @@ class ChatGptAiService:
                     str(content or "").strip(),
                     str(item.get("transcript_text") or "").strip(),
                     str(item.get("context_text") or "").strip(),
+                    str(item.get("ocr_text") or "").strip(),
                 ) if text
             )[:20_000],
             "source": str(item.get("source_chat_title") or item.get("sender_name") or "")[:500],
@@ -46,7 +48,7 @@ class ChatGptAiService:
         }
 
     @staticmethod
-    async def process_item(bot, settings: Settings, user_id: int, item) -> dict:
+    async def process_item(bot, settings: Settings, user_id: int, item, *, image_index: int | None = None) -> dict:
         item = dict(item)
         record = ChatGptAiService._record(item)
         image_kinds = item.get("kind") == "photo" or (
@@ -54,6 +56,22 @@ class ChatGptAiService:
             and item.get("mime_type") in {"image/jpeg", "image/png", "image/webp"}
         )
         file_id = item.get("telegram_file_id")
+        if image_kinds and item.get("kind") == "photo" and item.get("media_group_json"):
+            try:
+                media_group = json.loads(item["media_group_json"] or "[]")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                media_group = []
+            images = [
+                (index, entry.get("telegram_file_id"))
+                for index, entry in enumerate(media_group)
+                if isinstance(entry, dict) and entry.get("kind") == "photo" and entry.get("telegram_file_id")
+            ]
+            if images:
+                selected_index = image_index if image_index is not None else images[0][0]
+                selected_file = next((file_id for index, file_id in images if index == selected_index), None)
+                if not selected_file:
+                    raise ValueError("Не нашёл выбранное фото в альбоме.")
+                file_id = selected_file
         if image_kinds and file_id:
             telegram_file = await bot.get_file(file_id)
             if telegram_file.file_size and telegram_file.file_size > MAX_IMAGE_BYTES:

@@ -1147,6 +1147,29 @@ async def show_search_results_page(target, session_id: str, page: int, *, edit: 
         await _send_text(target, text, reply_markup=markup)
 
 
+def _item_image_entries(item) -> list[dict[str, Any]]:
+    kind = str(item["kind"] or "")
+    if kind == "photo":
+        try:
+            media_group = json.loads(item["media_group_json"] or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError, KeyError):
+            media_group = []
+        if isinstance(media_group, list):
+            images = [
+                {"index": index, **entry}
+                for index, entry in enumerate(media_group)
+                if isinstance(entry, dict) and entry.get("kind") == "photo" and entry.get("telegram_file_id")
+            ]
+            if images:
+                return images
+    if kind == "photo" or (
+        kind == "document" and item["mime_type"] in {"image/jpeg", "image/png", "image/webp"}
+    ):
+        file_id = item["telegram_file_id"]
+        return [{"index": 0, "kind": kind, "telegram_file_id": file_id}] if file_id else []
+    return []
+
+
 async def show_item_view(
     target,
     user_id: int,
@@ -1224,6 +1247,7 @@ async def show_item_view(
         "context_callback": context_callback,
     }
     _set_meta_value(f"item_view_state:{user_id}", json.dumps(view_state))
+    image_entries = _item_image_entries(row)
     markup = item_view_keyboard(
         back_callback,
         favorite_callback=favorite_callback,
@@ -1234,7 +1258,7 @@ async def show_item_view(
         review_move_callback=move_callback if origin == "review" else None,
         ocr_callback=(
             f"item_ocr_{item_id}"
-            if (row["kind"] == "photo" or (row["kind"] == "document" and row["mime_type"] in {"image/jpeg", "image/png", "image/webp"}))
+            if image_entries
             and _is_owner(user_id) and settings.chatgpt_ocr_url and settings.chatgpt_ocr_token
             else None
         ),
@@ -1260,6 +1284,8 @@ async def show_item_view(
         ),
         ai_accept_callback=(f"item_ai_accept_{item_id}" if row["ai_pending_description"] and row["ai_pending_tags"] else None),
         ai_cancel_callback=(f"item_ai_cancel_{item_id}" if row["ai_pending_description"] and row["ai_pending_tags"] else None),
+        ocr_accept_callback=(f"item_ocr_accept_{item_id}" if row["ocr_pending_text"] else None),
+        ocr_cancel_callback=(f"item_ocr_cancel_{item_id}" if row["ocr_pending_text"] else None),
         ai_callback_label=(
             "🎙 Расшифровать и добавить теги" if row["kind"] == "voice"
             else "✨ Обработать через ChatGPT"
@@ -1290,6 +1316,11 @@ async def show_item_view(
         header += "\n\n✨ Кратко: " + safe_excerpt(row["ai_description"], 900)
     if row["kind"] == "voice" and row["transcript_text"]:
         header += "\n\n📝 Расшифровка:\n" + safe_excerpt(row["transcript_text"], 2200)
+    if row["ocr_text"]:
+        header += "\n\n🧾 Текст с изображений:\n" + safe_excerpt(row["ocr_text"], 2400)
+    if row["ocr_pending_text"]:
+        image_number = int(row["ocr_pending_image_index"] or 0) + 1
+        header += f"\n\n🔎 Предложение OCR · фото {image_number} (ещё не сохранено):\n" + safe_excerpt(row["ocr_pending_text"], 1800)
     if row["link_url"] and row["link_url"] not in content:
         header += "\n\n🔗 " + str(row["link_url"])[:1400]
     if row["kind"] in media_kinds:
@@ -1321,6 +1352,35 @@ async def show_item_view(
     return
 
 
+def _image_picker_markup(item_id: int, images: list[dict[str, Any]], action: str) -> InlineKeyboardMarkup:
+    rows = []
+    pending_row = []
+    for image_number, image in enumerate(images, start=1):
+        pending_row.append(InlineKeyboardButton(
+            text=f"🖼 Фото {image_number}",
+            callback_data=f"item_{action}_image_{item_id}_{image['index']}",
+        ))
+        if len(pending_row) == 2:
+            rows.append(pending_row)
+            pending_row = []
+    if pending_row:
+        rows.append(pending_row)
+    rows.append([InlineKeyboardButton(text="⬅️ К материалу", callback_data=f"item_return_{item_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _show_image_picker(callback: CallbackQuery, item_id: int, images: list[dict[str, Any]], action: str):
+    verb = "расшифровать" if action == "ocr" else "передать ChatGPT"
+    state = _saved_item_view_state(callback.from_user.id, item_id) or {}
+    await render_menu_panel(
+        callback,
+        f"Выбери фото, которое нужно {verb} ({len(images)} в этом материале):",
+        _image_picker_markup(item_id, images, action),
+        keep_item_preview=bool(state.get("show_media_preview", True)),
+    )
+    await callback.answer()
+
+
 @dp.callback_query(F.data.regexp(r"^item_ocr_\d+$"))
 async def item_ocr_handler(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -1332,22 +1392,94 @@ async def item_ocr_handler(callback: CallbackQuery):
         return
     item_id = int(callback.data.rsplit("_", 1)[1])
     item = VaultService.get_item(user_id, item_id)
-    if not item or not (item["kind"] == "photo" or (item["kind"] == "document" and item["mime_type"] in {"image/jpeg", "image/png", "image/webp"})) or not item["telegram_file_id"]:
+    images = _item_image_entries(item) if item else []
+    if not item or not images:
         await callback.answer("Фото не найдено", show_alert=True)
         return
-    await callback.answer("Распознаю текст…")
-    try:
-        text = await ChatGptOcrService.transcribe_file(bot, settings, user_id, item["telegram_file_id"])
-    except Exception as exc:
-        logging.warning("OCR failed for owner=%s item=%s (%s)", user_id, item_id, type(exc).__name__)
-        message = str(exc).strip() or "Не удалось распознать текст. Попробуй ещё раз."
-        await callback.message.answer(message[:3900])
+    if len(images) > 1:
+        await _show_image_picker(callback, item_id, images, "ocr")
         return
-    for part in (text[i:i + 3900] for i in range(0, len(text), 3900)):
-        await callback.message.answer(part)
+    await _run_item_ocr(callback, item_id, images[0]["index"])
 
 
-@dp.callback_query(F.data.regexp(r"^item_ai_(?:(?:retry|undo)_)?\d+$"))
+@dp.callback_query(F.data.regexp(r"^item_ocr_image_\d+_\d+$"))
+async def item_ocr_image_handler(callback: CallbackQuery):
+    parts = callback.data.split("_")
+    await _run_item_ocr(callback, int(parts[3]), int(parts[4]))
+
+
+async def _run_item_ocr(callback: CallbackQuery, item_id: int, image_index: int):
+    user_id = callback.from_user.id
+    if not _is_owner(user_id):
+        await callback.answer("Доступно только владельцу бота", show_alert=True)
+        return
+    if not callback.message or callback.message.chat.type != "private":
+        await callback.answer("Открой фото в личном чате с ботом", show_alert=True)
+        return
+    item = VaultService.get_item(user_id, item_id)
+    images = _item_image_entries(item) if item else []
+    selected = next((image for image in images if image["index"] == image_index), None)
+    if not item or not selected:
+        await callback.answer("Фото не найдено", show_alert=True)
+        return
+    if not settings.chatgpt_ocr_url or not settings.chatgpt_ocr_token:
+        await callback.answer("OCR пока не настроен", show_alert=True)
+        return
+    await callback.answer("Распознаю текст…")
+    view_state = _saved_item_view_state(user_id, item_id) or {}
+    await render_menu_panel(
+        callback,
+        f"⏳ Распознаю фото {images.index(selected) + 1}…",
+        keep_item_preview=bool(view_state.get("show_media_preview", True)),
+    )
+    try:
+        text = await ChatGptOcrService.transcribe_file(bot, settings, user_id, selected["telegram_file_id"])
+        if not VaultService.propose_item_ocr(user_id, item_id, text, image_index):
+            raise RuntimeError("Материал уже удалён.")
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Добавить текст к материалу", callback_data=f"item_ocr_accept_{item_id}")],
+            [InlineKeyboardButton(text="✖️ Оставить без изменений", callback_data=f"item_ocr_cancel_{item_id}")],
+        ])
+        await render_menu_panel(
+            callback,
+            f"🔎 Распознанный текст · фото {images.index(selected) + 1}\n\n{safe_excerpt(text, 2800)}\n\nДобавить текст в карточку этого материала? Он сохранится вместе с фото и будет удалён вместе с ним.",
+            markup,
+            keep_item_preview=bool(view_state.get("show_media_preview", True)),
+        )
+    except Exception as exc:
+        logging.warning("OCR failed for owner=%s item=%s photo=%s (%s)", user_id, item_id, image_index + 1, type(exc).__name__)
+        await render_menu_panel(
+            callback,
+            f"❌ {str(exc).strip()[:900] or 'Не удалось распознать текст.'}",
+            InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ К материалу", callback_data=f"item_return_{item_id}")]]),
+            keep_item_preview=bool(view_state.get("show_media_preview", True)),
+        )
+
+
+@dp.callback_query(F.data.regexp(r"^item_ocr_(?:accept|cancel)_\d+$"))
+async def item_ocr_proposal_handler(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    if not _is_owner(user_id):
+        await callback.answer("Доступно только владельцу бота", show_alert=True)
+        return
+    action, item_id_text = callback.data.rsplit("_", 1)
+    item_id = int(item_id_text)
+    if action == "item_ocr_accept":
+        item = VaultService.accept_item_ocr(user_id, item_id)
+        if not item:
+            await callback.answer("Предложение OCR уже закрыто", show_alert=True)
+            return
+        await callback.answer("Текст добавлен в материал")
+    else:
+        item = VaultService.cancel_item_ocr(user_id, item_id)
+        if not item:
+            await callback.answer("Материал не найден", show_alert=True)
+            return
+        await callback.answer("Текст не сохранял")
+    await _return_to_item_card(callback, user_id, item_id)
+
+
+@dp.callback_query(F.data.regexp(r"^item_ai_(?:(?:(?:retry|undo)_)?\d+|image_\d+_\d+)$"))
 async def item_ai_handler(callback: CallbackQuery):
     user_id = callback.from_user.id
     if not _is_owner(user_id):
@@ -1360,9 +1492,16 @@ async def item_ai_handler(callback: CallbackQuery):
         await callback.answer("AI-обработка пока не настроена", show_alert=True)
         return
 
-    parts = callback.data.split("_")
-    action = parts[2] if len(parts) == 4 else "process"
-    item_id = int(parts[-1])
+    if callback.data.startswith("item_ai_image_"):
+        parts = callback.data.split("_")
+        action = "process"
+        item_id = int(parts[3])
+        selected_image_index = int(parts[4])
+    else:
+        parts = callback.data.split("_")
+        action = parts[2] if len(parts) == 4 else "process"
+        item_id = int(parts[-1])
+        selected_image_index = None
     key = (user_id, item_id)
     if action == "undo":
         if key in ai_processing_items:
@@ -1383,6 +1522,15 @@ async def item_ai_handler(callback: CallbackQuery):
     if not item:
         await callback.answer("Запись не найдена", show_alert=True)
         return
+    images = _item_image_entries(item) if item["kind"] == "photo" else []
+    if action in {"process", "retry"} and selected_image_index is None and len(images) > 1:
+        await _show_image_picker(callback, item_id, images, "ai")
+        return
+    if selected_image_index is not None and not any(image["index"] == selected_image_index for image in images):
+        await callback.answer("Фото не найдено", show_alert=True)
+        return
+    if images and selected_image_index is None:
+        selected_image_index = images[0]["index"]
     if item["kind"] == "voice" and not settings.groq_api_key:
         await callback.answer("Добавь GROQ_API_KEY в Environment UtilBot", show_alert=True)
         return
@@ -1401,7 +1549,9 @@ async def item_ai_handler(callback: CallbackQuery):
             transcript = await GroqTranscriptionService.transcribe_item(bot, settings, item)
             result = await ChatGptAiService.process_voice_transcript(settings, user_id, item, transcript)
         else:
-            result = await ChatGptAiService.process_item(bot, settings, user_id, item)
+            result = await ChatGptAiService.process_item(
+                bot, settings, user_id, item, image_index=selected_image_index,
+            )
         updated = VaultService.propose_item_ai_metadata(
             user_id, item_id, result["description"], result["tags"], transcript=transcript,
         )

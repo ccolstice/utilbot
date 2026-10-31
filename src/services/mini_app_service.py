@@ -68,6 +68,8 @@ class MiniAppService:
         app.router.add_post("/api/miniapp/items/bulk", self.bulk_action)
         app.router.add_get("/api/miniapp/items/{item_id:\\d+}/preview", self.photo_preview)
         app.router.add_post("/api/miniapp/items/{item_id:\\d+}/ocr", self.transcribe_photo)
+        app.router.add_post("/api/miniapp/items/{item_id:\\d+}/ocr/accept", self.accept_ocr)
+        app.router.add_post("/api/miniapp/items/{item_id:\\d+}/ocr/cancel", self.cancel_ocr)
         app.router.add_get("/api/miniapp/media/{user_id:\\d+}/{item_id:\\d+}", self.stream_media)
         app.router.add_get("/api/miniapp/reminders", self.list_reminders)
         app.router.add_post("/api/miniapp/reminders", self.create_reminder)
@@ -333,6 +335,7 @@ class MiniAppService:
             clauses.append("(" + " OR ".join([
                 "unicode_lower(COALESCE(i.content, '')) LIKE ?",
                 "unicode_lower(COALESCE(i.context_text, '')) LIKE ?",
+                "unicode_lower(COALESCE(i.ocr_text, '')) LIKE ?",
                 "unicode_lower(COALESCE(i.tag, '')) LIKE ?",
                 "unicode_lower(COALESCE(i.file_name, '')) LIKE ?",
                 "unicode_lower(COALESCE(i.sender_name, '')) LIKE ?",
@@ -341,7 +344,7 @@ class MiniAppService:
                 "unicode_lower(COALESCE(i.page_title, '')) LIKE ?",
                 "unicode_lower(COALESCE(f.name, '')) LIKE ?",
             ]) + ")")
-            params.extend([like] * 9)
+            params.extend([like] * 10)
 
         where = " AND ".join(clauses)
         conn = get_connection()
@@ -352,7 +355,7 @@ class MiniAppService:
                                i.file_size, i.media_type, i.sender_name, i.source_chat_title, i.created_at,
                                i.sender_username, i.is_forwarded, i.link_domain, i.mime_type, i.duration, i.width, i.height,
                                i.item_state, i.is_favorite, i.context_text, i.telegram_file_id,
-                               i.media_group_json,
+                               i.media_group_json, i.ocr_text, i.ocr_pending_text, i.ocr_pending_image_index,
                                i.link_url, i.page_title, f.name AS folder_name, f.emoji AS folder_emoji
                         FROM vault_items i JOIN vault_folders f ON f.id = i.folder_id
                         WHERE {where} ORDER BY i.id DESC"""
@@ -374,7 +377,7 @@ class MiniAppService:
                 if query:
                     query_needle = query.casefold()
                     search_fields = (
-                        "content", "context_text", "tag", "file_name", "sender_name",
+                        "content", "context_text", "ocr_text", "tag", "file_name", "sender_name",
                         "source_chat_title", "link_url", "page_title", "folder_name",
                     )
                     rows = [
@@ -406,11 +409,13 @@ class MiniAppService:
             item.pop("media_group_json", None)
             item["content"] = (item["content"] or "")[:1800]
             item["context_text"] = (item["context_text"] or "")[:1200]
+            item["ocr_text"] = (item.get("ocr_text") or "")[:6000]
+            item["ocr_pending_text"] = (item.get("ocr_pending_text") or "")[:6000]
             item["is_favorite"] = bool(item["is_favorite"])
             item["preview_url"] = f"/api/miniapp/items/{item['id']}/preview" if has_photo else None
             item["media_count"] = len(media_group)
             item["media_items"] = [
-                {"kind": media["kind"], "mime_type": media.get("mime_type"), "file_name": media.get("file_name"),
+                {"index": index, "kind": media["kind"], "mime_type": media.get("mime_type"), "file_name": media.get("file_name"),
                  "preview_url": f"/api/miniapp/items/{item['id']}/preview?index={index}" if media["kind"] == "photo" else None}
                 for index, media in enumerate(media_group)
             ] if len(media_group) > 1 else []
@@ -434,6 +439,7 @@ class MiniAppService:
                           i.file_size, i.media_type, i.mime_type, i.duration, i.width, i.height,
                           i.sender_name, i.sender_username, i.is_forwarded, i.source_chat_title, i.created_at,
                           i.item_state, i.is_favorite, i.context_text, i.telegram_file_id, i.media_group_json,
+                          i.ocr_text, i.ocr_pending_text, i.ocr_pending_image_index,
                           i.link_url, i.page_title, i.link_domain,
                           f.name AS folder_name, f.emoji AS folder_emoji
                    FROM vault_items i JOIN vault_folders f ON f.id = i.folder_id
@@ -451,7 +457,7 @@ class MiniAppService:
         item["preview_url"] = f"/api/miniapp/items/{item_id}/preview" if has_photo else None
         item["media_count"] = len(media_group)
         item["media_items"] = [
-            {"kind": media["kind"], "mime_type": media.get("mime_type"), "file_name": media.get("file_name"),
+            {"index": index, "kind": media["kind"], "mime_type": media.get("mime_type"), "file_name": media.get("file_name"),
              "preview_url": f"/api/miniapp/items/{item_id}/preview?index={index}" if media["kind"] == "photo" else None}
             for index, media in enumerate(media_group)
         ] if len(media_group) > 1 else []
@@ -461,6 +467,8 @@ class MiniAppService:
         item["ocr_available"] = bool(is_image and is_owner_user(user_id, self.settings) and self.settings.chatgpt_ocr_url and self.settings.chatgpt_ocr_token)
         item["content"] = (item["content"] or "")[:1800]
         item["context_text"] = (item["context_text"] or "")[:1200]
+        item["ocr_text"] = (item.get("ocr_text") or "")[:6000]
+        item["ocr_pending_text"] = (item.get("ocr_pending_text") or "")[:6000]
         item["is_favorite"] = bool(item["is_favorite"])
         item.pop("telegram_file_id", None)
         item.pop("media_group_json", None)
@@ -652,18 +660,30 @@ class MiniAppService:
         if not is_owner_user(user_id, self.settings):
             raise web.HTTPForbidden(text="Распознавание доступно только владельцу бота.")
         item_id = int(request.match_info["item_id"])
+        try:
+            body = await request.json()
+            image_index = int(body.get("index", 0)) if isinstance(body, dict) else 0
+        except (ValueError, TypeError, json.JSONDecodeError):
+            raise web.HTTPBadRequest(text="Некорректный номер картинки.")
+        if image_index < 0:
+            raise web.HTTPBadRequest(text="Некорректный номер картинки.")
         conn = get_connection()
         try:
             row = conn.execute(
-                "SELECT telegram_file_id, kind, mime_type FROM vault_items WHERE user_id = ? AND id = ?",
+                "SELECT telegram_file_id, media_group_json, kind, mime_type, file_name FROM vault_items WHERE user_id = ? AND id = ?",
                 (user_id, item_id),
             ).fetchone()
         finally:
             conn.close()
-        if not row or not (row["kind"] == "photo" or (row["kind"] == "document" and row["mime_type"] in {"image/jpeg", "image/png", "image/webp"})) or not row["telegram_file_id"]:
+        media_group = _media_group(row) if row else []
+        if not row or image_index >= len(media_group):
             raise web.HTTPNotFound(text="Фото не найдено.")
+        media = media_group[image_index]
+        is_image = media.get("kind") == "photo" or (media.get("kind") == "document" and media.get("mime_type") in {"image/jpeg", "image/png", "image/webp"})
+        if not is_image:
+            raise web.HTTPNotFound(text="В этом материале нет выбранного фото.")
         try:
-            text = await ChatGptOcrService.transcribe_file(self.bot, self.settings, user_id, row["telegram_file_id"])
+            text = await ChatGptOcrService.transcribe_file(self.bot, self.settings, user_id, media["telegram_file_id"])
         except ValueError as exc:
             raise web.HTTPBadRequest(text=str(exc))
         except RuntimeError as exc:
@@ -671,7 +691,29 @@ class MiniAppService:
         except Exception as exc:
             logger.warning("Mini App OCR failed for user=%s item=%s (%s)", user_id, item_id, type(exc).__name__)
             raise web.HTTPBadGateway(text="Не удалось распознать текст. Попробуй ещё раз.")
-        return web.json_response({"text": text}, headers={"Cache-Control": "no-store"})
+        if not VaultService.propose_item_ocr(user_id, item_id, text, image_index):
+            raise web.HTTPNotFound(text="Материал не найден.")
+        return web.json_response({"text": text, "image_index": image_index}, headers={"Cache-Control": "no-store"})
+
+    async def accept_ocr(self, request: web.Request) -> web.Response:
+        user_id = self._authenticated_user_id(request)
+        if not is_owner_user(user_id, self.settings):
+            raise web.HTTPForbidden(text="Доступно только владельцу бота.")
+        item_id = int(request.match_info["item_id"])
+        item = VaultService.accept_item_ocr(user_id, item_id)
+        if not item:
+            raise web.HTTPNotFound(text="Предложение OCR уже закрыто или материал удалён.")
+        return web.json_response({"ocr_text": item["ocr_text"] or ""}, headers={"Cache-Control": "no-store"})
+
+    async def cancel_ocr(self, request: web.Request) -> web.Response:
+        user_id = self._authenticated_user_id(request)
+        if not is_owner_user(user_id, self.settings):
+            raise web.HTTPForbidden(text="Доступно только владельцу бота.")
+        item_id = int(request.match_info["item_id"])
+        item = VaultService.cancel_item_ocr(user_id, item_id)
+        if not item:
+            raise web.HTTPNotFound(text="Предложение OCR уже закрыто или материал удалён.")
+        return web.json_response({"ok": True}, headers={"Cache-Control": "no-store"})
 
     def _signed_media_url(self, user_id: int, item_id: int, index: int = 0) -> str:
         expires = int(time.time()) + 900

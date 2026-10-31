@@ -175,6 +175,10 @@ def init_db():
         voice_duration INTEGER,
         transcript_text TEXT,
         transcript_status TEXT DEFAULT NULL,
+        ocr_text TEXT,
+        ocr_results_json TEXT NOT NULL DEFAULT '{}',
+        ocr_pending_text TEXT,
+        ocr_pending_image_index INTEGER,
         processing_started_at TIMESTAMP DEFAULT NULL,
         processing_completed_at TIMESTAMP DEFAULT NULL,
         sender_name TEXT,
@@ -304,6 +308,10 @@ def init_db():
     _ensure_column(conn, "vault_items", "voice_duration INTEGER")
     _ensure_column(conn, "vault_items", "transcript_text TEXT")
     _ensure_column(conn, "vault_items", "transcript_status TEXT DEFAULT NULL")
+    _ensure_column(conn, "vault_items", "ocr_text TEXT")
+    _ensure_column(conn, "vault_items", "ocr_results_json TEXT NOT NULL DEFAULT '{}'")
+    _ensure_column(conn, "vault_items", "ocr_pending_text TEXT")
+    _ensure_column(conn, "vault_items", "ocr_pending_image_index INTEGER")
     _ensure_column(conn, "vault_items", "processing_started_at TIMESTAMP DEFAULT NULL")
     _ensure_column(conn, "vault_items", "processing_completed_at TIMESTAMP DEFAULT NULL")
     _ensure_column(conn, "rss_entries", "notified INTEGER NOT NULL DEFAULT 0")
