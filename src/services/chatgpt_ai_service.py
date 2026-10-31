@@ -28,7 +28,7 @@ class ChatGptAiService:
     def _record(item) -> dict:
         item = dict(item)
         content = item.get("content")
-        if item.get("ai_analysis_active") and item.get("ai_previous_content") is not None:
+        if item.get("ai_analysis_active") and item.get("ai_previous_content_set"):
             content = item["ai_previous_content"]
         return {
             "kind": str(item.get("kind") or ""),

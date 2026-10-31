@@ -55,7 +55,9 @@ class GroqTranscriptionService:
                     if response.status == 429:
                         raise RuntimeError("Достигнут лимит бесплатного распознавания Groq. Попробуй позже.")
                     if response.status != 200:
-                        detail = str((payload.get("error") or {}).get("message") or f"HTTP {response.status}")
+                        error_payload = payload.get("error")
+                        detail = error_payload.get("message") if isinstance(error_payload, dict) else error_payload
+                        detail = str(detail or f"HTTP {response.status}")
                         raise RuntimeError(f"Groq не распознал голосовое: {detail[:240]}")
         except (aiohttp.ClientError, TimeoutError) as exc:
             raise RuntimeError("Не удалось связаться с Groq или истекло время ожидания.") from exc

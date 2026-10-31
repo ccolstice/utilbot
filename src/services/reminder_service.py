@@ -392,7 +392,7 @@ class ReminderService:
         return row
 
     @staticmethod
-    async def clear_notification_messages(bot, user_id: int, reminder_id: int, *, exclude_message_id: int | None = None):
+    async def clear_notification_messages(bot, user_id: int, reminder_id: int):
         conn = get_connection()
         rows = conn.execute(
             "SELECT chat_id, message_id FROM reminder_notifications WHERE user_id = ? AND reminder_id = ?",
@@ -402,8 +402,6 @@ class ReminderService:
         conn.commit()
         conn.close()
         for row in rows:
-            if exclude_message_id is not None and int(row["message_id"]) == exclude_message_id:
-                continue
             try:
                 await bot.delete_message(int(row["chat_id"]), int(row["message_id"]))
             except Exception:

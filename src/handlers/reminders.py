@@ -319,12 +319,7 @@ async def reminder_done_callback(callback: CallbackQuery):
         ReminderService.reschedule_recurring(reminder_id, int(repeat_minutes))
     else:
         ReminderService.mark_done(callback.from_user.id, reminder_id)
-    await ReminderService.clear_notification_messages(
-        callback.bot,
-        callback.from_user.id,
-        reminder_id,
-        exclude_message_id=callback.message.message_id if callback.message else None,
-    )
+    await ReminderService.clear_notification_messages(callback.bot, callback.from_user.id, reminder_id)
 
     await show_reminders_page(callback, callback.from_user.id, page, edit=True)
 
@@ -335,12 +330,7 @@ async def reminder_delete_callback(callback: CallbackQuery):
     reminder_id = int(parts[2])
     page = int(parts[3])
     ReminderService.delete_reminder(callback.from_user.id, reminder_id)
-    await ReminderService.clear_notification_messages(
-        callback.bot,
-        callback.from_user.id,
-        reminder_id,
-        exclude_message_id=callback.message.message_id if callback.message else None,
-    )
+    await ReminderService.clear_notification_messages(callback.bot, callback.from_user.id, reminder_id)
     await show_reminders_page(callback, callback.from_user.id, page, edit=True)
 
 
@@ -359,10 +349,5 @@ async def reminder_snooze_callback(callback: CallbackQuery):
     page = int(parts[3])
     minutes = int(parts[4])
     ReminderService.snooze_reminder(callback.from_user.id, reminder_id, minutes)
-    await ReminderService.clear_notification_messages(
-        callback.bot,
-        callback.from_user.id,
-        reminder_id,
-        exclude_message_id=callback.message.message_id if callback.message else None,
-    )
+    await ReminderService.clear_notification_messages(callback.bot, callback.from_user.id, reminder_id)
     await show_reminders_page(callback, callback.from_user.id, page, edit=True)
