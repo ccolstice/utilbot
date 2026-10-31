@@ -352,6 +352,10 @@ class ReminderService:
         conn = get_connection()
         now = datetime.utcnow().replace(microsecond=0)
         next_retry = now + timedelta(minutes=retry_minutes)
+        previous_messages = conn.execute(
+            "SELECT chat_id, message_id FROM reminder_notifications WHERE user_id = ? AND reminder_id = ?",
+            (user_id, reminder_id),
+        ).fetchall()
         cursor = conn.execute(
             """
             UPDATE reminders
@@ -371,6 +375,7 @@ class ReminderService:
             ),
         )
         if cursor.rowcount:
+            conn.execute("DELETE FROM reminder_notifications WHERE user_id = ? AND reminder_id = ?", (user_id, reminder_id))
             conn.execute(
                 "INSERT OR IGNORE INTO reminder_notifications (reminder_id, user_id, chat_id, message_id) VALUES (?, ?, ?, ?)",
                 (reminder_id, user_id, chat_id, message_id),
@@ -380,16 +385,8 @@ class ReminderService:
             conn.close()
             return None
         conn.commit()
-        row = conn.execute(
-            """
-            SELECT *
-            FROM reminders
-            WHERE user_id = ? AND id = ?
-            """,
-            (user_id, reminder_id),
-        ).fetchone()
         conn.close()
-        return row
+        return previous_messages
 
     @staticmethod
     async def clear_notification_messages(bot, user_id: int, reminder_id: int):
@@ -428,18 +425,24 @@ async def reminder_worker(bot, interval_seconds: int = 30):
                     reply_markup=reminder_notification_keyboard(reminder_id, row["source_item_id"]),
                 )
 
-                registered = ReminderService.register_notification(
+                previous_messages = ReminderService.register_notification(
                     user_id,
                     reminder_id,
                     int(sent.chat.id),
                     int(sent.message_id),
                     DEFAULT_REMINDER_RETRY_MINUTES,
                 )
-                if not registered:
+                if previous_messages is None:
                     try:
                         await bot.delete_message(sent.chat.id, sent.message_id)
                     except Exception:
                         logger.debug("Could not remove stale reminder message %s", sent.message_id, exc_info=True)
+                else:
+                    for previous in previous_messages:
+                        try:
+                            await bot.delete_message(int(previous["chat_id"]), int(previous["message_id"]))
+                        except Exception:
+                            logger.debug("Could not replace old reminder message %s", previous["message_id"], exc_info=True)
         except Exception:
             logger.exception("Reminder worker failed")
 
