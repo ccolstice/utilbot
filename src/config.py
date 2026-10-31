@@ -53,6 +53,7 @@ class Settings:
     chatgpt_ocr_token: str
     chatgpt_ai_url: str
     chatgpt_ai_token: str
+    groq_api_key: str
 
 
 def get_settings() -> Settings:
@@ -71,6 +72,7 @@ def get_settings() -> Settings:
     chatgpt_ocr_token = os.getenv("CHATGPT_OCR_TOKEN", "").strip()
     chatgpt_ai_url = os.getenv("CHATGPT_AI_URL", "").strip().rstrip("/")
     chatgpt_ai_token = os.getenv("CHATGPT_AI_TOKEN", "").strip()
+    groq_api_key = os.getenv("GROQ_API_KEY", "").strip()
     if bool(chatgpt_ocr_url) != bool(chatgpt_ocr_token):
         raise RuntimeError("Set both CHATGPT_OCR_URL and CHATGPT_OCR_TOKEN to enable OCR.")
     if chatgpt_ocr_url and not chatgpt_ocr_url.startswith("https://"):
@@ -100,4 +102,5 @@ def get_settings() -> Settings:
         chatgpt_ocr_token=chatgpt_ocr_token,
         chatgpt_ai_url=chatgpt_ai_url,
         chatgpt_ai_token=chatgpt_ai_token,
+        groq_api_key=groq_api_key,
     )

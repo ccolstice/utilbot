@@ -74,6 +74,7 @@ from src.services.index_service import IndexService
 from src.services.media_service import MediaService
 from src.services.chatgpt_ocr_service import ChatGptOcrService
 from src.services.chatgpt_ai_service import ChatGptAiService
+from src.services.groq_transcription_service import GroqTranscriptionService
 from src.services.link_service import LinkService
 from src.services.rss_service import RSSService
 from src.states.save_state import SaveStates
@@ -539,8 +540,11 @@ async def _save_text_payload(
     archive_message_id: int | None = None,
     item_state: str = "saved",
     dedupe_key: str | None = None,
+    link_url_hint: str | None = None,
 ) -> int:
     link = await LinkService.enrich_first_link(text)
+    if not link and link_url_hint:
+        link = await LinkService.enrich_first_link(link_url_hint)
     if dedupe_key is None:
         normalized = f"url:{link.url}" if link else f"text:{' '.join(text.casefold().split())}"
         dedupe_key = "text:" + hashlib.sha256(normalized.encode("utf-8")).hexdigest()
@@ -604,6 +608,15 @@ def _message_attribution(message: Message) -> tuple[str | None, str | None, str 
     )
 
 
+def _message_link_url(message: Message) -> str | None:
+    entities = message.entities if message.text else message.caption_entities
+    for entity in entities or []:
+        entity_type = getattr(getattr(entity, "type", None), "value", getattr(entity, "type", None))
+        if entity_type == "text_link" and getattr(entity, "url", None):
+            return str(entity.url)
+    return None
+
+
 async def _archive_message(message: Message, destination_chat_id: int):
     """Keep Telegram's native forwarded-from label when the source is forwarded."""
     if getattr(message, "forward_origin", None):
@@ -651,8 +664,11 @@ def _save_media_payload(
         dedupe_key = _capture_dedupe_key(message, payload)
 
     link = LinkService.first_link(payload.content) if payload.kind == "text" else None
-    kind = "link" if link else payload.kind
-    media_type = "link" if link else payload.media_type
+    if not link and _message_link_url(message):
+        link = LinkService.first_link(_message_link_url(message))
+    is_link_item = payload.kind == "text" and link is not None
+    kind = "link" if is_link_item else payload.kind
+    media_type = "link" if is_link_item else payload.media_type
 
     return VaultService.save_item(
         user_id=user_id,
@@ -1217,12 +1233,14 @@ async def show_item_view(
         ai_callback=(
             f"item_ai_{item_id}"
             if _is_owner(user_id) and settings.chatgpt_ai_url and settings.chatgpt_ai_token
+            and (row["kind"] != "voice" or settings.groq_api_key)
             and not row["ai_analysis_active"]
             else None
         ),
         ai_retry_callback=(
             f"item_ai_retry_{item_id}"
             if _is_owner(user_id) and settings.chatgpt_ai_url and settings.chatgpt_ai_token
+            and (row["kind"] != "voice" or settings.groq_api_key)
             and row["ai_analysis_active"]
             else None
         ),
@@ -1231,6 +1249,12 @@ async def show_item_view(
             if _is_owner(user_id) and settings.chatgpt_ai_url and settings.chatgpt_ai_token
             and row["ai_analysis_active"]
             else None
+        ),
+        ai_accept_callback=(f"item_ai_accept_{item_id}" if row["ai_pending_description"] and row["ai_pending_tags"] else None),
+        ai_cancel_callback=(f"item_ai_cancel_{item_id}" if row["ai_pending_description"] and row["ai_pending_tags"] else None),
+        ai_callback_label=(
+            "🎙 Расшифровать и добавить теги" if row["kind"] == "voice"
+            else "✨ Обработать через ChatGPT"
         ),
     )
     current_state = row["item_state"] if "item_state" in row.keys() else "saved"
@@ -1243,6 +1267,9 @@ async def show_item_view(
         "voice": "Голосовое", "audio": "Аудио", "text": "Текст",
     }
     content = row["content"] or ""
+    is_forwarded = bool(row["is_forwarded"])
+    if row["ai_description"] and not is_forwarded and row["kind"] != "voice":
+        content = row["ai_description"]
     header = (
         f"{folder_name}\n{attribution}\n🕒 {dt}\n🏷 {tag}\n"
         f"#{item_id} · {kind_labels.get(row['kind'], row['kind'].title())}"
@@ -1251,8 +1278,12 @@ async def show_item_view(
         header = "⚡ Разбор входящих\n\n" + header
     if row["context_text"]:
         header += "\n\n🗒 Контекст: " + safe_excerpt(row["context_text"], 700)
-    if row["ai_description"]:
+    if row["ai_description"] and is_forwarded:
         header += "\n\n✨ Кратко: " + safe_excerpt(row["ai_description"], 900)
+    if row["kind"] == "voice" and row["transcript_text"]:
+        header += "\n\n📝 Расшифровка:\n" + safe_excerpt(row["transcript_text"], 2200)
+    if row["link_url"] and row["link_url"] not in content:
+        header += "\n\n🔗 " + str(row["link_url"])[:1400]
     if row["kind"] in media_kinds:
         if content:
             header += "\n\n" + safe_excerpt(content, 1200)
@@ -1344,23 +1375,98 @@ async def item_ai_handler(callback: CallbackQuery):
     if not item:
         await callback.answer("Запись не найдена", show_alert=True)
         return
+    if item["kind"] == "voice" and not settings.groq_api_key:
+        await callback.answer("Добавь GROQ_API_KEY в Environment UtilBot", show_alert=True)
+        return
 
     ai_processing_items.add(key)
-    await callback.answer("Отправляю запись в ChatGPT…" if action == "process" else "Повторно обрабатываю запись…")
-    progress = await callback.message.answer("⏳ Обрабатываю запись: обновляю описание и теги…")
+    await callback.answer("Распознаю голосовое…" if item["kind"] == "voice" else ("Отправляю запись в ChatGPT…" if action == "process" else "Повторно обрабатываю запись…"))
+    progress_text = "⏳ Распознаю голосовое и подбираю теги…" if item["kind"] == "voice" else "⏳ Готовлю предложение по описанию и тегам…"
+    if action == "retry" and item["ai_pending_description"]:
+        progress = callback.message
+        await progress.edit_text(progress_text)
+    else:
+        progress = await callback.message.answer(progress_text)
     try:
-        result = await ChatGptAiService.process_item(bot, settings, user_id, item)
-        updated = VaultService.update_item_ai_metadata(user_id, item_id, result["description"], result["tags"])
+        transcript = None
+        if item["kind"] == "voice":
+            transcript = await GroqTranscriptionService.transcribe_item(bot, settings, item)
+            result = await ChatGptAiService.process_voice_transcript(settings, user_id, item, transcript)
+        else:
+            result = await ChatGptAiService.process_item(bot, settings, user_id, item)
+        updated = VaultService.propose_item_ai_metadata(
+            user_id, item_id, result["description"], result["tags"], transcript=transcript,
+        )
         if not updated:
             raise RuntimeError("Запись уже удалена.")
-        await progress.delete()
-        await _return_to_item_card(callback, user_id, item_id)
+        description = safe_excerpt(result["description"], 2500)
+        tags = result["tags"]
+        if item["kind"] == "voice":
+            note = "После принятия полная расшифровка сохранится в карточке, а оригинальное голосовое останется доступно для прослушивания."
+        elif bool(item["is_forwarded"]):
+            note = "Исходное пересланное сообщение, его ссылка и автор останутся без изменений; добавится только краткая пометка."
+        else:
+            note = "После принятия это описание заменит старый текст, а теги будут заменены новыми."
+        if item["kind"] == "voice":
+            preview = f"📝 Полная расшифровка голосового\n\n{result['description']}\n\n🏷 Новые теги: {', '.join(tags)}\n\n{note}"
+        else:
+            original = str(item["content"] or "").strip()
+            if item["ai_analysis_active"] and item["ai_previous_content"] is not None:
+                original = str(item["ai_previous_content"] or "").strip()
+            before = f"Было:\n{safe_excerpt(original, 650)}\n\n" if original and not item["is_forwarded"] else ""
+            preview = f"📝 Предложение ChatGPT\n\n{before}{description}\n\n🏷 Новые теги: {', '.join(tags)}\n\n{note}"
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Принять замену", callback_data=f"item_ai_accept_{item_id}")],
+            [InlineKeyboardButton(text="🔁 Попробовать ещё", callback_data=f"item_ai_retry_{item_id}")],
+            [InlineKeyboardButton(text="✖️ Оставить как есть", callback_data=f"item_ai_cancel_{item_id}")],
+        ])
+        if item["kind"] == "voice" and len(preview) > 3900:
+            chunks = [preview[index:index + 3500] for index in range(0, len(preview), 3500)]
+            await progress.edit_text(chunks[0])
+            for chunk in chunks[1:-1]:
+                await callback.message.answer(chunk)
+            await callback.message.answer(chunks[-1], reply_markup=markup)
+        else:
+            await progress.edit_text(preview[:4000], reply_markup=markup)
     except Exception as exc:
         logging.warning("ChatGPT archive processing failed for owner=%s item=%s (%s)", user_id, item_id, type(exc).__name__)
         message = str(exc).strip() or "Не удалось обработать запись. Попробуй ещё раз."
         await progress.edit_text(f"❌ {message[:900]}")
     finally:
         ai_processing_items.discard(key)
+
+
+@dp.callback_query(F.data.regexp(r"^item_ai_(?:accept|cancel)_\d+$"))
+async def item_ai_proposal_handler(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    if not _is_owner(user_id):
+        await callback.answer("Доступно только владельцу бота", show_alert=True)
+        return
+    if not callback.message or callback.message.chat.type != "private":
+        await callback.answer("Открой запись в личном чате с ботом", show_alert=True)
+        return
+    action, item_id_text = callback.data.rsplit("_", 1)
+    item_id = int(item_id_text)
+    if (user_id, item_id) in ai_processing_items:
+        await callback.answer("Запись ещё обрабатывается", show_alert=True)
+        return
+    if action == "item_ai_accept":
+        item = VaultService.accept_item_ai_proposal(user_id, item_id)
+        if not item:
+            await callback.answer("Предложение уже закрыто", show_alert=True)
+            return
+        await callback.answer("Замену применил")
+        with suppress(Exception):
+            await callback.message.edit_text("✅ Предложение применено. Карточка обновлена.")
+    else:
+        item = VaultService.cancel_item_ai_proposal(user_id, item_id)
+        if not item:
+            await callback.answer("Запись не найдена", show_alert=True)
+            return
+        await callback.answer("Оставил исходный материал")
+        with suppress(Exception):
+            await callback.message.edit_text("✖️ Предложение отменено. Исходный материал оставлен без изменений.")
+    await _return_to_item_card(callback, user_id, item_id)
 
 
 def _saved_item_view_state(user_id: int, item_id: int) -> dict[str, Any] | None:
@@ -3073,6 +3179,7 @@ async def _capture_incoming_message_locked(message: Message, state: FSMContext):
                 archive_message_id=archive.message_id,
                 item_state="inbox",
                 dedupe_key=dedupe_key,
+                link_url_hint=_message_link_url(message),
             )
         else:
             item_id = _save_media_payload(

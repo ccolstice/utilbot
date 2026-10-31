@@ -910,39 +910,83 @@ class VaultService:
         return row
 
     @staticmethod
-    def update_item_ai_metadata(user_id: int, item_id: int, description: str, tags: list[str]):
-        description = " ".join(str(description or "").split())[:1200]
+    def propose_item_ai_metadata(
+        user_id: int,
+        item_id: int,
+        description: str,
+        tags: list[str],
+        transcript: str | None = None,
+    ):
+        transcript = str(transcript).strip()[:20_000] if transcript is not None else None
+        description = transcript if transcript is not None else " ".join(str(description or "").split())[:1200]
         ai_tags = format_tags([str(tag).strip().lstrip("#") for tag in tags if str(tag).strip()])
+        if not description or not ai_tags:
+            return None
         conn = get_connection()
-        existing = conn.execute(
-            "SELECT * FROM vault_items WHERE user_id = ? AND id = ?",
-            (user_id, item_id),
-        ).fetchone()
-        if not existing:
+        conn.execute(
+            """
+            UPDATE vault_items SET ai_pending_description = ?, ai_pending_tags = ?, ai_pending_transcript = ?
+            WHERE user_id = ? AND id = ?
+            """,
+            (description, ai_tags, transcript, user_id, item_id),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM vault_items WHERE user_id = ? AND id = ?", (user_id, item_id)).fetchone()
+        conn.close()
+        return row
+
+    @staticmethod
+    def accept_item_ai_proposal(user_id: int, item_id: int):
+        conn = get_connection()
+        existing = conn.execute("SELECT * FROM vault_items WHERE user_id = ? AND id = ?", (user_id, item_id)).fetchone()
+        if not existing or not existing["ai_pending_description"] or not existing["ai_pending_tags"]:
             conn.close()
             return None
 
-        # Keep the pre-analysis state across retries so one undo always restores
-        # exactly what the user had before the first successful AI analysis.
         active = bool(existing["ai_analysis_active"])
         previous_description = existing["ai_previous_description"] if active else existing["ai_description"]
         previous_tags = existing["ai_previous_tags"] if active else existing["tag"]
         previous_ai_tags = existing["ai_previous_ai_tags"] if active else existing["ai_tags"]
+        previous_content = existing["ai_previous_content"] if active and existing["ai_previous_content_set"] else existing["content"]
+        previous_transcript = existing["ai_previous_transcript_text"] if active and existing["ai_previous_transcript_set"] else existing["transcript_text"]
+        previous_manual_tag = existing["ai_previous_manual_tag"] if active and existing["ai_previous_manual_tag_set"] else existing["manual_tag"]
+        is_voice = existing["kind"] == "voice" and existing["ai_pending_transcript"]
+        is_forwarded = bool(existing["is_forwarded"])
+        replacement_content = existing["content"]
+        if not is_voice and not is_forwarded:
+            replacement_content = existing["ai_pending_description"]
+        ai_description = existing["ai_pending_description"] if is_forwarded else None
+        transcript = existing["ai_pending_transcript"] if is_voice else existing["transcript_text"]
+        tags = existing["ai_pending_tags"]
         conn.execute(
             """
             UPDATE vault_items SET
-                ai_description = ?, ai_tags = ?, tag = ?,
+                content = ?, transcript_text = ?, ai_description = ?, ai_tags = ?, tag = ?, manual_tag = ?,
                 ai_previous_description = ?, ai_previous_tags = ?, ai_previous_ai_tags = ?,
-                ai_analysis_active = 1
+                ai_previous_content = ?, ai_previous_transcript_text = ?, ai_previous_manual_tag = ?,
+                ai_previous_content_set = 1, ai_previous_transcript_set = 1, ai_previous_manual_tag_set = 1,
+                ai_analysis_active = 1,
+                ai_pending_description = NULL, ai_pending_tags = NULL, ai_pending_transcript = NULL
             WHERE user_id = ? AND id = ?
             """,
-            (description, ai_tags, ai_tags, previous_description, previous_tags, previous_ai_tags, user_id, item_id),
+            (replacement_content, transcript, ai_description, tags, tags, tags,
+             previous_description, previous_tags, previous_ai_tags, previous_content, previous_transcript, previous_manual_tag,
+             user_id, item_id),
         )
         conn.commit()
-        row = conn.execute(
-            "SELECT * FROM vault_items WHERE user_id = ? AND id = ?",
+        row = conn.execute("SELECT * FROM vault_items WHERE user_id = ? AND id = ?", (user_id, item_id)).fetchone()
+        conn.close()
+        return row
+
+    @staticmethod
+    def cancel_item_ai_proposal(user_id: int, item_id: int):
+        conn = get_connection()
+        conn.execute(
+            "UPDATE vault_items SET ai_pending_description = NULL, ai_pending_tags = NULL, ai_pending_transcript = NULL WHERE user_id = ? AND id = ?",
             (user_id, item_id),
-        ).fetchone()
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM vault_items WHERE user_id = ? AND id = ?", (user_id, item_id)).fetchone()
         conn.close()
         return row
 
@@ -962,9 +1006,21 @@ class VaultService:
                 ai_description = ai_previous_description,
                 tag = ai_previous_tags,
                 ai_tags = ai_previous_ai_tags,
+                content = CASE WHEN ai_previous_content_set = 1 THEN ai_previous_content ELSE content END,
+                transcript_text = CASE WHEN ai_previous_transcript_set = 1 THEN ai_previous_transcript_text ELSE transcript_text END,
+                manual_tag = CASE WHEN ai_previous_manual_tag_set = 1 THEN ai_previous_manual_tag ELSE manual_tag END,
                 ai_previous_description = NULL,
                 ai_previous_tags = NULL,
                 ai_previous_ai_tags = NULL,
+                ai_previous_content = NULL,
+                ai_previous_transcript_text = NULL,
+                ai_previous_manual_tag = NULL,
+                ai_previous_content_set = 0,
+                ai_previous_transcript_set = 0,
+                ai_previous_manual_tag_set = 0,
+                ai_pending_description = NULL,
+                ai_pending_tags = NULL,
+                ai_pending_transcript = NULL,
                 ai_analysis_active = 0
             WHERE user_id = ? AND id = ?
             """,

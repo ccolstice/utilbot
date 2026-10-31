@@ -465,6 +465,9 @@ def item_view_keyboard(
     ai_callback: str | None = None,
     ai_retry_callback: str | None = None,
     ai_undo_callback: str | None = None,
+    ai_accept_callback: str | None = None,
+    ai_cancel_callback: str | None = None,
+    ai_callback_label: str = "✨ Обработать через ChatGPT",
 ) -> InlineKeyboardMarkup:
     rows = []
     if favorite_callback:
@@ -489,7 +492,11 @@ def item_view_keyboard(
     if ocr_callback:
         rows.append([InlineKeyboardButton(text="🔎 Расшифровать картинку", callback_data=ocr_callback)])
     if ai_callback:
-        rows.append([InlineKeyboardButton(text="✨ Обработать с помощью ChatGPT", callback_data=ai_callback)])
+        rows.append([InlineKeyboardButton(text=ai_callback_label, callback_data=ai_callback)])
+    if ai_accept_callback:
+        rows.append([InlineKeyboardButton(text="✅ Принять замену", callback_data=ai_accept_callback)])
+    if ai_cancel_callback:
+        rows.append([InlineKeyboardButton(text="✖️ Оставить как есть", callback_data=ai_cancel_callback)])
     if ai_retry_callback:
         rows.append([InlineKeyboardButton(text="🔁 Попробовать ещё", callback_data=ai_retry_callback)])
     if ai_undo_callback:

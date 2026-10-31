@@ -342,25 +342,43 @@ class ReminderService:
         return row
 
     @staticmethod
-    def register_notification(user_id: int, reminder_id: int, retry_minutes: int = DEFAULT_REMINDER_RETRY_MINUTES):
+    def register_notification(
+        user_id: int,
+        reminder_id: int,
+        chat_id: int,
+        message_id: int,
+        retry_minutes: int = DEFAULT_REMINDER_RETRY_MINUTES,
+    ):
         conn = get_connection()
         now = datetime.utcnow().replace(microsecond=0)
         next_retry = now + timedelta(minutes=retry_minutes)
-        conn.execute(
+        cursor = conn.execute(
             """
             UPDATE reminders
             SET last_notified_at = ?,
                 next_retry_at = ?,
                 retry_count = COALESCE(retry_count, 0) + 1
-            WHERE user_id = ? AND id = ?
+            WHERE user_id = ? AND id = ? AND status = 'pending'
+              AND due_at <= ? AND (next_retry_at IS NULL OR next_retry_at <= ?)
             """,
             (
                 now.isoformat(sep=" "),
                 next_retry.isoformat(sep=" "),
                 user_id,
                 reminder_id,
+                now.isoformat(sep=" "),
+                now.isoformat(sep=" "),
             ),
         )
+        if cursor.rowcount:
+            conn.execute(
+                "INSERT OR IGNORE INTO reminder_notifications (reminder_id, user_id, chat_id, message_id) VALUES (?, ?, ?, ?)",
+                (reminder_id, user_id, chat_id, message_id),
+            )
+        else:
+            conn.commit()
+            conn.close()
+            return None
         conn.commit()
         row = conn.execute(
             """
@@ -372,6 +390,24 @@ class ReminderService:
         ).fetchone()
         conn.close()
         return row
+
+    @staticmethod
+    async def clear_notification_messages(bot, user_id: int, reminder_id: int, *, exclude_message_id: int | None = None):
+        conn = get_connection()
+        rows = conn.execute(
+            "SELECT chat_id, message_id FROM reminder_notifications WHERE user_id = ? AND reminder_id = ?",
+            (user_id, reminder_id),
+        ).fetchall()
+        conn.execute("DELETE FROM reminder_notifications WHERE user_id = ? AND reminder_id = ?", (user_id, reminder_id))
+        conn.commit()
+        conn.close()
+        for row in rows:
+            if exclude_message_id is not None and int(row["message_id"]) == exclude_message_id:
+                continue
+            try:
+                await bot.delete_message(int(row["chat_id"]), int(row["message_id"]))
+            except Exception:
+                logger.debug("Could not remove old reminder message %s/%s", row["chat_id"], row["message_id"], exc_info=True)
 
 
 async def reminder_worker(bot, interval_seconds: int = 30):
@@ -388,13 +424,24 @@ async def reminder_worker(bot, interval_seconds: int = 30):
                 if retry_count > 0:
                     extra = f"Повтор #{retry_count + 1}. Если не нажмёшь кнопку, я повторю это через 5 минут."
 
-                await bot.send_message(
+                sent = await bot.send_message(
                     user_id,
                     f"🔔 Напоминание\n\n{title}\n\n{extra}",
                     reply_markup=reminder_notification_keyboard(reminder_id, row["source_item_id"]),
                 )
 
-                ReminderService.register_notification(user_id, reminder_id, DEFAULT_REMINDER_RETRY_MINUTES)
+                registered = ReminderService.register_notification(
+                    user_id,
+                    reminder_id,
+                    int(sent.chat.id),
+                    int(sent.message_id),
+                    DEFAULT_REMINDER_RETRY_MINUTES,
+                )
+                if not registered:
+                    try:
+                        await bot.delete_message(sent.chat.id, sent.message_id)
+                    except Exception:
+                        logger.debug("Could not remove stale reminder message %s", sent.message_id, exc_info=True)
         except Exception:
             logger.exception("Reminder worker failed")
 

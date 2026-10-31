@@ -154,6 +154,15 @@ def init_db():
         ai_previous_description TEXT,
         ai_previous_tags TEXT,
         ai_previous_ai_tags TEXT,
+        ai_previous_content TEXT,
+        ai_previous_transcript_text TEXT,
+        ai_previous_manual_tag TEXT,
+        ai_previous_content_set INTEGER NOT NULL DEFAULT 0,
+        ai_previous_transcript_set INTEGER NOT NULL DEFAULT 0,
+        ai_previous_manual_tag_set INTEGER NOT NULL DEFAULT 0,
+        ai_pending_description TEXT,
+        ai_pending_tags TEXT,
+        ai_pending_transcript TEXT,
         ai_analysis_active INTEGER NOT NULL DEFAULT 0,
         tag TEXT,
         telegram_file_id TEXT,
@@ -205,6 +214,15 @@ def init_db():
         retry_count INTEGER DEFAULT 0,
         source_item_id INTEGER DEFAULT NULL,
         note TEXT DEFAULT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS reminder_notifications (
+        reminder_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        chat_id INTEGER NOT NULL,
+        message_id INTEGER NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (reminder_id, chat_id, message_id)
     );
 
     CREATE TABLE IF NOT EXISTS collections (
@@ -304,6 +322,15 @@ def init_db():
     _ensure_column(conn, "vault_items", "ai_previous_description TEXT")
     _ensure_column(conn, "vault_items", "ai_previous_tags TEXT")
     _ensure_column(conn, "vault_items", "ai_previous_ai_tags TEXT")
+    _ensure_column(conn, "vault_items", "ai_previous_content TEXT")
+    _ensure_column(conn, "vault_items", "ai_previous_transcript_text TEXT")
+    _ensure_column(conn, "vault_items", "ai_previous_manual_tag TEXT")
+    _ensure_column(conn, "vault_items", "ai_previous_content_set INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(conn, "vault_items", "ai_previous_transcript_set INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(conn, "vault_items", "ai_previous_manual_tag_set INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(conn, "vault_items", "ai_pending_description TEXT")
+    _ensure_column(conn, "vault_items", "ai_pending_tags TEXT")
+    _ensure_column(conn, "vault_items", "ai_pending_transcript TEXT")
     _ensure_column(conn, "vault_items", "ai_analysis_active INTEGER NOT NULL DEFAULT 0")
     _ensure_column(conn, "vault_items", "link_url TEXT")
     _ensure_column(conn, "vault_items", "link_domain TEXT")
