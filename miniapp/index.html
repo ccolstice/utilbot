@@ -5,9 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
     <meta name="theme-color" content="#111019">
     <title>Мой архив · Утиляшка</title>
-    <link rel="stylesheet" href="/miniapp/styles.css?v=7">
+    <link rel="stylesheet" href="/miniapp/styles.css?v=8">
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
-    <script src="/miniapp/app.js?v=7" defer></script>
+    <script src="/miniapp/app.js?v=8" defer></script>
   </head>
   <body>
     <main class="app-shell">
@@ -33,6 +33,14 @@
           <input id="search" type="search" placeholder="Найти в архиве" autocomplete="off">
           <button id="clear-search" class="clear-search" type="button" aria-label="Очистить поиск">×</button>
         </label>
+        <div id="type-chips" class="type-chips" role="group" aria-label="Быстрый фильтр по типу">
+          <button type="button" data-kind="all" class="selected" aria-pressed="true">Все</button>
+          <button type="button" data-kind="photo" aria-pressed="false">▧ Фото</button>
+          <button type="button" data-kind="text" aria-pressed="false">≡ Заметки</button>
+          <button type="button" data-kind="voice" aria-pressed="false">◖ ГС</button>
+          <button type="button" data-kind="video" aria-pressed="false">▶ Видео</button>
+          <button type="button" data-kind="document" aria-pressed="false">▤ Файлы</button>
+        </div>
         <div class="filter-caption"><span>РАЗЛОЖИМ ПО ПОЛОЧКАМ?</span><i aria-hidden="true">✷</i></div>
         <div class="filters-row">
           <div class="folder-filter-row"><select id="folder-filter" aria-label="Папка"><option value="">Все папки</option></select><button id="create-folder" class="quiet-button" type="button">＋ Папка</button></div>
@@ -40,7 +48,8 @@
             <option value="all">Все типы</option>
             <option value="photo">Фото</option><option value="text">Текст</option>
             <option value="link">Ссылки</option><option value="document">Файлы</option>
-            <option value="video">Видео</option><option value="audio">Аудио</option>
+            <option value="video">Видео</option><option value="video_note">Видеосообщения</option>
+            <option value="animation">GIF</option><option value="audio">Аудио</option>
             <option value="voice">Голосовые</option><option value="sticker">Стикеры</option>
           </select>
           <select id="state-filter" aria-label="Статус">

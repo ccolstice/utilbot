@@ -203,8 +203,10 @@ class VaultService:
         content: str | None = None,
         tag: str | None = None,
         telegram_file_id: str | None = None,
+        media_group_json: str | None = None,
         archive_chat_id: int | None = None,
         archive_message_id: int | None = None,
+        archive_message_ids: str | None = None,
         item_state: str = "saved",
         dedupe_key: str | None = None,
         voice_duration: int | None = None,
@@ -248,8 +250,10 @@ class VaultService:
                 content,
                 tag,
                 telegram_file_id,
+                media_group_json,
                 archive_chat_id,
                 archive_message_id,
+                archive_message_ids,
                 item_state,
                 dedupe_key,
                 voice_duration,
@@ -277,7 +281,7 @@ class VaultService:
                 is_favorite,
                 favorited_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 user_id,
@@ -286,8 +290,10 @@ class VaultService:
                 content,
                 tag,
                 telegram_file_id,
+                media_group_json,
                 archive_chat_id,
                 archive_message_id,
+                archive_message_ids,
                 item_state,
                 dedupe_key,
                 voice_duration,

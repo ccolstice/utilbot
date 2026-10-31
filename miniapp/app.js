@@ -20,12 +20,11 @@
   }
   function titleFor(item) {
     if (item.kind === "text") return "Текстовая заметка";
-    const source = item.content || item.page_title || item.file_name || ({ photo: "Фото", document: "Файл", video: "Видео", voice: "Голосовое", audio: "Аудио", sticker: "Стикер", animation: "GIF", video_note: "Видеосообщение", link: "Ссылка" }[item.kind] || "Текст");
-    const cleaned = String(source).replace(/https?:\/\/\S+/g, (url) => url).trim();
-    return cleaned || "Материал";
+    if (item.kind === "link") return item.page_title || item.link_domain || "Ссылка";
+    return item.file_name || item.page_title || ({ photo: "Фото", document: "Файл", video: "Видео", voice: "Голосовое", audio: "Аудио", sticker: "Стикер", animation: "GIF", video_note: "Видеосообщение" }[item.kind] || item.content || "Материал");
   }
   function kindIcon(kind) { return ({ photo: "▧", text: "≡", link: "↗", document: "▤", video: "▶", animation: "▧", sticker: "◉", voice: "◖", audio: "♫", video_note: "◉" })[kind] || "▤"; }
-  function tagsOf(item) { return String(item.tag || "").split(",").map((tag) => tag.trim()).filter(Boolean).slice(0, 3); }
+  function tagsOf(item) { return String(item.tag || "").split(",").map((tag) => tag.trim()).filter(Boolean).slice(0, 2); }
   function toast(message) {
     const node = $("toast"); node.textContent = message; node.classList.add("visible");
     clearTimeout(toast.timer); toast.timer = setTimeout(() => node.classList.remove("visible"), 2400);
@@ -111,20 +110,25 @@
       const tags = tagsOf(item).map((tag) => `<span class="tag-pill">#${escapeHtml(tag)}</span>`).join("");
       const title = titleFor(item);
       const isText = item.kind === "text";
+      const excerpt = item.content ? `<div class="card-excerpt">${escapeHtml(String(item.content).trim())}</div>` : "";
+      const audioPlayer = item.kind === "voice" && item.media_url
+        ? `<audio class="card-audio" controls preload="none" src="${escapeHtml(item.media_url)}" aria-label="Слушать голосовое"></audio>` : "";
+      const albumBadge = item.media_count > 1 ? `<span class="album-count">▧ ${item.media_count}</span>` : "";
       const preview = item.preview_url
-        ? `<div class="item-preview"><img data-preview="${item.id}" alt="Превью материала" loading="lazy"></div>`
-        : isText ? "" : `<div class="item-preview"><span class="preview-placeholder">${kindIcon(item.kind)}</span></div>`;
-      const textExcerpt = isText ? `<div class="text-excerpt">${escapeHtml((item.content || "Текстовая запись").trim())}</div>` : "";
+        ? `<div class="item-preview"><img data-preview="${item.id}" alt="Превью материала" loading="lazy">${albumBadge}</div>`
+        : isText ? "" : `<div class="item-preview"><span class="preview-placeholder">${kindIcon(item.kind)}</span>${albumBadge}</div>`;
       return `<article class="item-card${isText ? " text-card" : ""}${selected ? " selected" : ""}" data-id="${item.id}" tabindex="0" role="button" aria-label="${escapeHtml(title)}">
         <span class="selection-check" aria-hidden="true">${selected ? "✓" : ""}</span>
         ${item.is_favorite ? '<span class="favorite-mark" aria-label="В избранном">⭐</span>' : ""}
         ${preview}<div class="card-body"><div class="card-title">${escapeHtml(title)}</div>
-        ${textExcerpt}
+        ${excerpt}${audioPlayer}
         <div class="card-meta"><span class="card-folder">${escapeHtml(item.folder_emoji || "📁")} ${escapeHtml(item.folder_name)}</span><time>${escapeHtml(displayDate(item.created_at))}</time></div>
         ${tags ? `<div class="tag-list">${tags}</div>` : ""}</div></article>`;
     }).join("");
     grid.querySelectorAll(".item-card").forEach((card) => {
       card.addEventListener("click", () => onCardClick(Number(card.dataset.id)));
+      card.querySelector("audio")?.addEventListener("click", (event) => event.stopPropagation());
+      card.querySelector("audio")?.addEventListener("keydown", (event) => event.stopPropagation());
       card.addEventListener("contextmenu", (event) => { event.preventDefault(); openDetails(Number(card.dataset.id)); });
       card.addEventListener("keydown", (event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); onCardClick(Number(card.dataset.id)); } });
       enableLongPressMove(card);
@@ -137,13 +141,15 @@
   function observePhotos() { grid.querySelectorAll("img[data-preview]").forEach((image) => photoObserver.observe(image)); }
   async function fetchPhoto(image) {
     try {
-      const response = await fetch(`/api/miniapp/items/${image.dataset.preview}/preview`, { headers: apiHeaders });
+      const index = image.dataset.previewIndex;
+      const suffix = index === undefined ? "" : `?index=${encodeURIComponent(index)}`;
+      const response = await fetch(`/api/miniapp/items/${image.dataset.preview}/preview${suffix}`, { headers: apiHeaders });
       if (!response.ok) throw new Error("preview failed");
       image.src = URL.createObjectURL(await response.blob());
     } catch { image.parentElement.innerHTML = '<span class="preview-placeholder">▧</span>'; }
   }
   function isVisualItem(item) {
-    return item?.kind === "photo" || (item?.kind === "sticker" && item.mime_type === "image/webp");
+    return item?.kind === "photo" || item?.media_items?.some((media) => media.kind === "photo") || (item?.kind === "sticker" && item.mime_type === "image/webp");
   }
   async function showMediaViewerItem(index) {
     const items = state.mediaViewerItems || [];
@@ -157,7 +163,9 @@
     image.alt = titleFor(item);
     $("media-viewer-content").replaceChildren(image);
     $("media-viewer-title").textContent = titleFor(item);
-    $("media-viewer-caption").textContent = `${state.mediaViewerIndex + 1} / ${items.length}${item.content ? ` · ${String(item.content).slice(0, 120)}` : ""}`;
+    const viewPosition = item.viewer_index === undefined ? state.mediaViewerIndex + 1 : item.viewer_index + 1;
+    const viewCount = item.viewer_count || items.length;
+    $("media-viewer-caption").textContent = `${viewPosition} / ${viewCount}${item.content ? ` · ${String(item.content).slice(0, 90)}` : ""}`;
     $("media-viewer-prev").disabled = items.length < 2;
     $("media-viewer-next").disabled = items.length < 2;
     try {
@@ -176,9 +184,21 @@
       if (requestId === state.mediaViewerRequest) $("media-viewer-caption").textContent = error.message;
     }
   }
-  function openMediaViewer(item) {
-    state.mediaViewerItems = state.currentItems.filter(isVisualItem);
-    let index = state.mediaViewerItems.findIndex((candidate) => candidate.id === item.id);
+  function openMediaViewer(item, albumIndex = null) {
+    const photos = item.media_items?.filter((media) => media.kind === "photo") || [];
+    let index;
+    if (photos.length > 1) {
+      state.mediaViewerItems = photos.map((media, photoIndex) => ({
+        ...item,
+        preview_url: media.preview_url || `/api/miniapp/items/${item.id}/preview?index=${photoIndex}`,
+        viewer_index: photoIndex,
+        viewer_count: photos.length,
+      }));
+      index = albumIndex ?? 0;
+    } else {
+      state.mediaViewerItems = state.currentItems.filter(isVisualItem);
+      index = state.mediaViewerItems.findIndex((candidate) => candidate.id === item.id);
+    }
     if (index < 0) { state.mediaViewerItems.unshift(item); index = 0; }
     if (!$("media-viewer").open) $("media-viewer").showModal();
     document.body.classList.add("media-open");
@@ -232,13 +252,17 @@
     if (!item) return;
     const tags = tagsOf(item).map((tag) => `<span class="tag-pill">#${escapeHtml(tag)}</span>`).join("");
     const stateLabels = { inbox: "Входящие", later: "На потом", saved: "Разобрано", done: "Готово" };
+    const albumPhotos = item.media_items?.filter((media) => media.kind === "photo") || [];
     let media = "";
-    if (item.preview_url) media = `<img class="detail-image" data-preview="${item.id}" alt="Фото">`;
+    if (albumPhotos.length > 1) media = `<div class="album-gallery">${albumPhotos.map((photo, index) => `<button type="button" class="album-thumb" data-album-index="${index}" aria-label="Открыть фото ${index + 1} из ${albumPhotos.length}"><img data-preview="${item.id}" data-preview-index="${index}" alt="Фото ${index + 1}" loading="lazy"></button>`).join("")}</div><p class="action-note">Альбом · ${albumPhotos.length} фото</p>`;
+    else if (item.preview_url) media = `<img class="detail-image" data-preview="${item.id}" alt="Фото">`;
     else if (item.has_media && ["video", "video_note", "animation"].includes(item.kind)) media = `<video class="detail-video" data-media controls playsinline preload="metadata" aria-label="${escapeHtml(titleFor(item))}"></video>`;
     else if (item.has_media && ["voice", "audio"].includes(item.kind)) media = `<audio class="detail-audio" data-media controls preload="metadata" aria-label="${escapeHtml(titleFor(item))}"></audio>`;
     else if (item.has_media && item.kind === "sticker" && item.mime_type === "image/webp") media = `<img class="detail-image" data-media alt="Стикер">`;
     else if (item.has_media) media = `<a class="media-file-link" data-media href="#" target="_blank" rel="noopener">↗ Открыть файл${item.file_name ? `: ${escapeHtml(item.file_name)}` : ""}</a>`;
-    const mediaExpand = item.preview_url || (item.kind === "sticker" && item.mime_type === "image/webp")
+    const mediaExpand = albumPhotos.length > 1
+      ? `<button type="button" class="media-expand" data-expand-media>⛶ Смотреть альбом · ${albumPhotos.length}</button>`
+      : item.preview_url || (item.kind === "sticker" && item.mime_type === "image/webp")
       ? '<button type="button" class="media-expand" data-expand-media>⛶ На весь экран</button>'
       : ["video", "video_note", "animation"].includes(item.kind) ? '<button type="button" class="media-expand" data-expand-media>⛶ Развернуть видео</button>' : "";
     const text = item.content || item.link_url || item.file_name || "";
@@ -256,7 +280,7 @@
         <button type="button" class="danger-action" data-item-action="delete">🗑 Удалить</button>
       </div>`;
     $("detail-dialog").showModal();
-    const image = $("detail-content").querySelector("img[data-preview]"); if (image) fetchPhoto(image);
+    const images = $("detail-content").querySelectorAll("img[data-preview]"); images.forEach(fetchPhoto);
     const mediaNode = $("detail-content").querySelector("[data-media]");
     if (mediaNode) api(`/api/miniapp/items/${item.id}/media-link`).then(({ url }) => {
       if (!mediaNode.isConnected || $("detail-content").dataset.itemId !== String(item.id)) return;
@@ -269,7 +293,7 @@
       else showAction(button.dataset.itemAction, [item.id], !item.is_favorite);
     }));
     const imageNode = $("detail-content").querySelector("img[data-preview], img[data-media]");
-    imageNode?.addEventListener("click", () => openMediaViewer(item));
+    $("detail-content").querySelectorAll("img[data-preview]").forEach((image) => image.addEventListener("click", () => openMediaViewer(item, Number(image.dataset.previewIndex || 0))));
     $("detail-content").querySelector("[data-expand-media]")?.addEventListener("click", () => {
       if (imageNode) openMediaViewer(item);
       else {
@@ -491,7 +515,7 @@
       delete card.dataset.suppressClick; event.preventDefault(); event.stopImmediatePropagation();
     }, true);
     card.addEventListener("pointerdown", (event) => {
-      if (event.pointerType === "touch" || event.button !== 0 || state.selectMode || state.selected.size) return;
+      if (event.target.closest("audio") || event.pointerType === "touch" || event.button !== 0 || state.selectMode || state.selected.size) return;
       clearActiveDrag();
       const drag = activeDrag = { card, input: "pointer", pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, dragging: false, ghost: null };
       drag.timer = setTimeout(() => {
@@ -502,7 +526,7 @@
       if (activeDrag?.input === "pointer" && activeDrag.pointerId === event.pointerId) clearActiveDrag();
     });
     card.addEventListener("touchstart", (event) => {
-      if (event.touches.length !== 1 || state.selectMode || state.selected.size) return;
+      if (event.target.closest("audio") || event.touches.length !== 1 || state.selectMode || state.selected.size) return;
       clearActiveDrag();
       const touch = event.changedTouches[0];
       const drag = activeDrag = { card, input: "touch", touchId: touch.identifier, startX: touch.clientX, startY: touch.clientY, dragging: false, ghost: null };
@@ -584,12 +608,27 @@
   function filtersChanged() {
     state.page = 1; state.selected.clear(); state.selectMode = false; updateSelectionBar(); loadItems();
   }
-  for (const id of ["folder-filter", "kind-filter", "state-filter", "tag-filter"]) $(id).addEventListener("change", filtersChanged);
+  const syncTypeChips = () => {
+    document.querySelectorAll(".type-chips [data-kind]").forEach((button) => {
+      const active = button.dataset.kind === $("kind-filter").value;
+      button.classList.toggle("selected", active);
+      button.setAttribute("aria-pressed", String(active));
+    });
+  };
+  $("type-chips").addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-kind]");
+    if (!button) return;
+    $("kind-filter").value = button.dataset.kind;
+    syncTypeChips();
+    filtersChanged();
+  });
+  for (const id of ["folder-filter", "state-filter", "tag-filter"]) $(id).addEventListener("change", filtersChanged);
+  $("kind-filter").addEventListener("change", () => { syncTypeChips(); filtersChanged(); });
   $("search").addEventListener("input", () => { clearTimeout(state.timer); state.timer = setTimeout(filtersChanged, 260); });
   $("clear-search").addEventListener("click", () => { $("search").value = ""; filtersChanged(); });
   $("favorites-filter").addEventListener("click", () => { const button = $("favorites-filter"); button.setAttribute("aria-pressed", button.getAttribute("aria-pressed") === "true" ? "false" : "true"); filtersChanged(); });
   $("reset-filters").addEventListener("click", () => {
-    $("search").value = ""; $("folder-filter").value = ""; $("kind-filter").value = "all"; $("state-filter").value = "all"; $("tag-filter").value = ""; $("favorites-filter").setAttribute("aria-pressed", "false"); state.source = null; renderSources(); filtersChanged();
+    $("search").value = ""; $("folder-filter").value = ""; $("kind-filter").value = "all"; $("state-filter").value = "all"; $("tag-filter").value = ""; $("favorites-filter").setAttribute("aria-pressed", "false"); state.source = null; renderSources(); syncTypeChips(); filtersChanged();
   });
 
   Promise.all([loadFolders(), loadSources(), loadReminders()]).then(loadItems).then(async () => {
