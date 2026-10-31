@@ -1845,7 +1845,14 @@ async def inline_archive_search(inline_query: InlineQuery):
     if query.casefold().startswith("emoji-test"):
         sample = custom_emoji_inline_test.get(inline_query.from_user.id)
         if not sample:
-            await inline_query.answer([], cache_time=0, is_personal=True)
+            await inline_query.answer([InlineQueryResultArticle(
+                id=f"emoji_test_missing_{inline_query.from_user.id}",
+                title="Сначала отправь custom emoji боту",
+                description="Тестовый смайлик хранится только до перезапуска сервиса",
+                input_message_content=InputTextMessageContent(
+                    message_text="Сначала отправь один custom emoji в личный чат Утил-бота, затем повтори emoji-test."
+                ),
+            )], cache_time=0, is_personal=True)
             return
         results = []
         if sample.get("sticker_file_id"):
@@ -1867,11 +1874,21 @@ async def inline_archive_search(inline_query: InlineQuery):
                 )],
             ),
         ))
+        fallback_result = InlineQueryResultArticle(
+            id=f"emoji_fallback_{inline_query.from_user.id}",
+            title="⚠️ Только обычный fallback, не исходный emoji",
+            description="Telegram отклонил custom emoji результат; это только диагностика",
+            input_message_content=InputTextMessageContent(message_text=sample["fallback"]),
+        )
         try:
             await inline_query.answer(results, cache_time=0, is_personal=True)
         except TelegramBadRequest:
             logging.exception("Telegram rejected the custom emoji inline test result")
-            await inline_query.answer([], cache_time=0, is_personal=True)
+            try:
+                await inline_query.answer([fallback_result], cache_time=0, is_personal=True)
+            except TelegramBadRequest:
+                logging.exception("Telegram rejected even the plain fallback inline result")
+                await inline_query.answer([], cache_time=0, is_personal=True)
         return
 
     direct_match = re.fullmatch(r"item:(\d+)", query, flags=re.IGNORECASE)
