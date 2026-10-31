@@ -30,6 +30,7 @@ from aiogram.types import (
     InlineQueryResultCachedDocument,
     InlineQueryResultCachedGif,
     InlineQueryResultCachedPhoto,
+    InlineQueryResultCachedSticker,
     InlineQueryResultCachedVideo,
     InlineQueryResultCachedVoice,
     InputMediaAnimation,
@@ -1812,10 +1813,21 @@ async def capture_custom_emoji_for_inline_test(message: Message):
         "fallback": fallback,
         "length": entity.length,
     }
+    try:
+        stickers = await bot.get_custom_emoji_stickers([entity.custom_emoji_id])
+        if stickers:
+            custom_emoji_inline_test[message.from_user.id]["sticker_file_id"] = stickers[0].file_id
+    except Exception:
+        logging.exception("Could not fetch sticker file for custom emoji inline test")
     me = await bot.get_me()
+    sticker_status = (
+        "\nTelegram также выдал sticker-файл для отдельного теста."
+        if custom_emoji_inline_test[message.from_user.id].get("sticker_file_id")
+        else "\nПолучить sticker-файл по ID не удалось; останется текстовый тест."
+    )
     await message.answer(
         "🧪 Получил custom emoji из Telegram-сущности. Сохранил один смайлик только в памяти процесса.\n"
-        f"ID: {entity.custom_emoji_id}\n\n"
+        f"ID: {entity.custom_emoji_id}{sticker_status}\n\n"
         f"Нажми кнопку и выбери результат. Для проверки в другом чате введи @{me.username} emoji-test.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(
@@ -1835,10 +1847,16 @@ async def inline_archive_search(inline_query: InlineQuery):
         if not sample:
             await inline_query.answer([], cache_time=0, is_personal=True)
             return
-        result = InlineQueryResultArticle(
-            id=f"emoji_test_{inline_query.from_user.id}",
-            title="Проверить custom emoji",
-            description="Выбери результат: в сообщении должен появиться сохранённый emoji",
+        results = []
+        if sample.get("sticker_file_id"):
+            results.append(InlineQueryResultCachedSticker(
+                id=f"emoji_sticker_{inline_query.from_user.id}",
+                sticker_file_id=sample["sticker_file_id"],
+            ))
+        results.append(InlineQueryResultArticle(
+            id=f"emoji_text_{inline_query.from_user.id}",
+            title="Текстовый тест (может стать обычным emoji)",
+            description="Проверка custom_emoji сущности в тексте inline-сообщения",
             input_message_content=InputTextMessageContent(
                 message_text=sample["fallback"],
                 entities=[MessageEntity(
@@ -1848,9 +1866,9 @@ async def inline_archive_search(inline_query: InlineQuery):
                     custom_emoji_id=sample["custom_emoji_id"],
                 )],
             ),
-        )
+        ))
         try:
-            await inline_query.answer([result], cache_time=0, is_personal=True)
+            await inline_query.answer(results, cache_time=0, is_personal=True)
         except TelegramBadRequest:
             logging.exception("Telegram rejected the custom emoji inline test result")
             await inline_query.answer([], cache_time=0, is_personal=True)
