@@ -25,25 +25,30 @@ def _image_mime(data: bytes, declared_type: str = "") -> str:
 
 class ChatGptAiService:
     @staticmethod
-    async def process_item(bot, settings: Settings, user_id: int, item) -> dict:
-        if not settings.chatgpt_ai_url or not settings.chatgpt_ai_token:
-            raise RuntimeError("AI-обработка не настроена.")
-
+    def _record(item) -> dict:
         item = dict(item)
-        record = {
+        content = item.get("content")
+        if item.get("ai_analysis_active") and item.get("ai_previous_content_set"):
+            content = item["ai_previous_content"]
+        return {
             "kind": str(item.get("kind") or ""),
             "title": str(item.get("page_title") or item.get("file_name") or "")[:500],
             "content": "\n\n".join(
                 text for text in (
-                    str(item.get("content") or "").strip(),
+                    str(content or "").strip(),
                     str(item.get("transcript_text") or "").strip(),
                     str(item.get("context_text") or "").strip(),
                 ) if text
             )[:20_000],
             "source": str(item.get("source_chat_title") or item.get("sender_name") or "")[:500],
             "url": str(item.get("link_url") or "")[:1500],
+            "is_forwarded": bool(item.get("is_forwarded")),
         }
 
+    @staticmethod
+    async def process_item(bot, settings: Settings, user_id: int, item) -> dict:
+        item = dict(item)
+        record = ChatGptAiService._record(item)
         image_kinds = item.get("kind") == "photo" or (
             item.get("kind") == "document"
             and item.get("mime_type") in {"image/jpeg", "image/png", "image/webp"}
@@ -60,13 +65,27 @@ class ChatGptAiService:
                 raise ValueError("Размер изображения должен быть не больше 15 МБ.")
             record["mime_type"] = _image_mime(image, str(item.get("mime_type") or ""))
             record["image_base64"] = base64.b64encode(image).decode("ascii")
+        return await ChatGptAiService._request(settings, user_id, record)
 
+    @staticmethod
+    async def process_voice_transcript(settings: Settings, user_id: int, item, transcript: str) -> dict:
+        record = ChatGptAiService._record(item)
+        caption = str(record.get("content") or "").strip()
+        record["content"] = "\n\n".join(part for part in (caption, transcript[:20_000]) if part)
+        record["kind"] = "voice"
+        result = await ChatGptAiService._request(settings, user_id, record, mode="voice_tags")
+        return {"description": transcript[:20_000], "tags": result["tags"], "transcript": transcript[:20_000]}
+
+    @staticmethod
+    async def _request(settings: Settings, user_id: int, record: dict, *, mode: str = "process") -> dict:
+        if not settings.chatgpt_ai_url or not settings.chatgpt_ai_token:
+            raise RuntimeError("AI-обработка не настроена.")
         timeout = aiohttp.ClientTimeout(total=240, connect=15)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(
                 settings.chatgpt_ai_url,
                 headers={"Authorization": f"Bearer {settings.chatgpt_ai_token}"},
-                json={"user_id": user_id, "record": record},
+                json={"user_id": user_id, "record": record, "mode": mode},
             ) as response:
                 try:
                     payload = await response.json(content_type=None)
@@ -77,6 +96,6 @@ class ChatGptAiService:
                     raise RuntimeError(message[:500])
                 description = str(payload.get("description") or "").strip()
                 tags = payload.get("tags")
-                if not description or not isinstance(tags, list):
+                if not isinstance(tags, list) or (mode != "voice_tags" and not description):
                     raise RuntimeError("ChatGPT вернул некорректный результат.")
                 return {"description": description[:1200], "tags": [str(tag)[:40] for tag in tags[:8]]}
