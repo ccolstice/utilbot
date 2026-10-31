@@ -112,6 +112,9 @@ dp.include_router(capture_router)
 
 pending_media: dict[int, Message] = {}
 capture_locks: dict[int, asyncio.Lock] = {}
+media_group_messages: dict[tuple[int, str], list[Message]] = {}
+media_group_states: dict[tuple[int, str], FSMContext] = {}
+media_group_tasks: dict[tuple[int, str], asyncio.Task] = {}
 search_sessions: dict[str, dict[str, Any]] = {}
 ai_processing_items: set[tuple[int, int]] = set()
 health_server: HealthServer | None = None
@@ -651,13 +654,16 @@ def _save_media_payload(
     archive_message_id: int | None = None,
     item_state: str = "saved",
     dedupe_key: str | None = None,
+    payload_override=None,
+    media_group_json: str | None = None,
+    archive_message_ids: str | None = None,
 ):
     sender_name, sender_username, source_chat_title = _message_attribution(message)
     is_forwarded = bool(getattr(message, "forward_origin", None))
     source_chat_id = message.chat.id if message.chat else None
     source_message_id = message.message_id
 
-    payload = MediaService.from_message(message)
+    payload = payload_override or MediaService.from_message(message)
     if payload is None:
         return None
     if dedupe_key is None:
@@ -678,8 +684,10 @@ def _save_media_payload(
         tag=tag,
         manual_tag=tag,
         telegram_file_id=payload.telegram_file_id,
+        media_group_json=media_group_json,
         archive_chat_id=archive_chat_id,
         archive_message_id=archive_message_id,
+        archive_message_ids=archive_message_ids,
         item_state=item_state,
         dedupe_key=dedupe_key,
         voice_duration=payload.duration,
@@ -2768,13 +2776,19 @@ async def _delete_archived_item(user_id: int, item_id: int) -> tuple[bool, bool]
     archive_removed = False
     archive_message_id = item["archive_message_id"]
     context_message_id = item["context_message_id"]
+    try:
+        archive_message_ids = [int(value) for value in json.loads(item["archive_message_ids"] or "[]")]
+    except (TypeError, ValueError, json.JSONDecodeError):
+        archive_message_ids = []
+    if not archive_message_ids and archive_message_id:
+        archive_message_ids = [int(archive_message_id)]
 
-    for message_id in (context_message_id, archive_message_id):
+    for message_id in ([context_message_id] if context_message_id else []) + archive_message_ids:
         if not message_id:
             continue
         try:
             await bot.delete_message(chat_id, int(message_id))
-            if message_id == archive_message_id:
+            if message_id in archive_message_ids:
                 archive_removed = True
         except Exception:
             logging.info(
@@ -3122,9 +3136,188 @@ async def inbox_bulk_apply(callback: CallbackQuery):
 async def capture_incoming_message(message: Message, state: FSMContext):
     if not message.from_user:
         return
+    if message.media_group_id:
+        key = (message.chat.id, str(message.media_group_id))
+        media_group_messages.setdefault(key, []).append(message)
+        media_group_states[key] = state
+        previous = media_group_tasks.get(key)
+        if previous and not previous.done():
+            previous.cancel()
+        media_group_tasks[key] = asyncio.create_task(_flush_media_group(key))
+        return
     lock = capture_locks.setdefault(message.from_user.id, asyncio.Lock())
     async with lock:
         await _capture_incoming_message_locked(message, state)
+
+
+async def _flush_media_group(key: tuple[int, str]) -> None:
+    try:
+        # Telegram delivers each album element as a separate update. A short
+        # quiet window lets all parts arrive before we create the archive row.
+        await asyncio.sleep(1.5)
+        pending = media_group_messages.get(key, [])
+        if not pending or not pending[0].from_user:
+            return
+        user_id = pending[0].from_user.id
+        lock = capture_locks.setdefault(user_id, asyncio.Lock())
+        async with lock:
+            # If another album part arrived while waiting for this user's
+            # capture lock, that part replaced this timer and will flush later.
+            if media_group_tasks.get(key) is not asyncio.current_task():
+                return
+            messages = sorted(media_group_messages.pop(key, []), key=lambda message: message.message_id)
+            state = media_group_states.pop(key, None)
+            media_group_tasks.pop(key, None)
+            if not messages or state is None:
+                return
+            await _capture_media_group_locked(messages, state)
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        logging.exception("Could not collect Telegram media group %s", key[1])
+
+
+async def _capture_media_group_locked(messages: list[Message], state: FSMContext) -> None:
+    first = messages[0]
+    if (
+        not first.from_user
+        or first.chat.type != "private"
+        or await state.get_state() is not None
+        or (first.text or "").lstrip().startswith("/")
+    ):
+        return
+
+    parts = [(message, MediaService.from_message(message)) for message in messages]
+    parts = [(message, payload) for message, payload in parts if payload and payload.telegram_file_id]
+    if not parts:
+        return
+
+    # Telegram media groups carry their caption on one element in the normal
+    # case; retain every non-empty caption if an album contains more than one.
+    captions = list(dict.fromkeys(
+        "\n".join((message.caption or "").strip().splitlines()).strip()
+        for message, _ in parts if (message.caption or "").strip()
+    ))
+    representative, payload = next(
+        ((message, part) for message, part in parts if (message.caption or "").strip()),
+        parts[0],
+    )
+    if captions:
+        payload.content = "\n".join(captions)
+
+    group_files = []
+    unique_keys = []
+    for message, part in parts:
+        file_obj = (
+            message.photo[-1] if message.photo else message.video or message.document
+            or message.animation or message.audio or message.voice
+        )
+        unique_id = getattr(file_obj, "file_unique_id", None)
+        if unique_id:
+            unique_keys.append(str(unique_id))
+        group_files.append({
+            "kind": part.kind,
+            "telegram_file_id": part.telegram_file_id,
+            "mime_type": part.mime_type or part.media_type,
+            "file_name": part.file_name,
+            "file_size": part.file_size,
+            "width": part.width,
+            "height": part.height,
+            "duration": part.duration,
+        })
+    if not group_files:
+        return
+
+    if len(group_files) == 1:
+        await _capture_incoming_message_locked(representative, state)
+        return
+
+    user_id = first.from_user.id
+    dedupe_key = "album:" + hashlib.sha256("|".join(unique_keys).encode("utf-8")).hexdigest()
+    duplicate = VaultService.find_duplicate_item(user_id, dedupe_key)
+    if duplicate:
+        removed = True
+        for message in messages:
+            try:
+                await message.delete()
+            except Exception:
+                removed = False
+                logging.warning("Could not remove duplicate album part %s", message.message_id, exc_info=True)
+        await _show_duplicate_item(representative, duplicate, incoming_removed=removed)
+        return
+
+    archived_ids: list[int] = []
+    item_id = None
+    try:
+        source_ids = [message.message_id for message in messages]
+        forwarded = all(getattr(message, "forward_origin", None) for message, _ in parts)
+        copy_method = bot.forward_messages if forwarded else bot.copy_messages
+        try:
+            copied = await copy_method(
+                chat_id=first.chat.id,
+                from_chat_id=first.chat.id,
+                message_ids=source_ids,
+            )
+        except TelegramBadRequest:
+            if forwarded:
+                copied = await bot.copy_messages(
+                    chat_id=first.chat.id,
+                    from_chat_id=first.chat.id,
+                    message_ids=source_ids,
+                )
+            else:
+                raise
+        archived_ids = [int(message.message_id) for message in copied]
+        if not archived_ids:
+            raise RuntimeError("Telegram did not return copied album message IDs")
+
+        folder = VaultService.get_or_create_default_folder(user_id)
+        item_id = _save_media_payload(
+            user_id,
+            int(folder["id"]),
+            representative,
+            payload_override=payload,
+            media_group_json=json.dumps(group_files, ensure_ascii=False),
+            archive_chat_id=first.chat.id,
+            archive_message_id=archived_ids[0],
+            archive_message_ids=json.dumps(archived_ids),
+            item_state="inbox",
+            dedupe_key=dedupe_key,
+        )
+        if not item_id:
+            raise ValueError("Unsupported Telegram media group")
+    except Exception:
+        logging.exception("Automatic capture failed for media group %s", first.media_group_id)
+        for message_id in archived_ids:
+            with suppress(Exception):
+                await bot.delete_message(first.chat.id, message_id)
+        await render_menu_panel(
+            representative,
+            "⚠️ Не удалось сохранить альбом целиком. Исходные сообщения оставил на месте — попробуй ещё раз.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    for message_id in archived_ids:
+        with suppress(Exception):
+            await bot.edit_message_reply_markup(chat_id=first.chat.id, message_id=message_id, reply_markup=None)
+    source_removed = True
+    for message in messages:
+        try:
+            await message.delete()
+        except Exception:
+            source_removed = False
+            logging.warning("Saved album %s, but source part %s remains", item_id, message.message_id, exc_info=True)
+    await show_item_view(
+        representative,
+        user_id,
+        item_id,
+        origin="all",
+        page=1,
+        show_media_preview=False,
+    )
+    if not source_removed:
+        logging.info("Album %s was saved, but one or more source messages remain visible", item_id)
 
 
 async def _capture_incoming_message_locked(message: Message, state: FSMContext):

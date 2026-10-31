@@ -166,8 +166,10 @@ def init_db():
         ai_analysis_active INTEGER NOT NULL DEFAULT 0,
         tag TEXT,
         telegram_file_id TEXT,
+        media_group_json TEXT,
         archive_chat_id INTEGER,
         archive_message_id INTEGER,
+        archive_message_ids TEXT,
         item_state TEXT NOT NULL DEFAULT 'saved',
         dedupe_key TEXT,
         voice_duration INTEGER,
@@ -289,8 +291,10 @@ def init_db():
         conn.execute("UPDATE vault_folders SET emoji = ? WHERE id = ?", (random_folder_emoji(), row["id"]))
     _ensure_column(conn, "vault_items", "tag TEXT")
     _ensure_column(conn, "vault_items", "telegram_file_id TEXT")
+    _ensure_column(conn, "vault_items", "media_group_json TEXT")
     _ensure_column(conn, "vault_items", "archive_chat_id INTEGER")
     _ensure_column(conn, "vault_items", "archive_message_id INTEGER")
+    _ensure_column(conn, "vault_items", "archive_message_ids TEXT")
     _ensure_column(conn, "vault_items", "item_state TEXT NOT NULL DEFAULT 'saved'")
     _ensure_column(conn, "vault_items", "dedupe_key TEXT")
     conn.execute(

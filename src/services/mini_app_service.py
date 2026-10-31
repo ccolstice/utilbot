@@ -31,6 +31,23 @@ VALID_KINDS = {
 }
 
 
+def _media_group(row) -> list[dict]:
+    try:
+        value = json.loads(row["media_group_json"] or "[]")
+        if isinstance(value, list):
+            return [entry for entry in value if isinstance(entry, dict) and entry.get("telegram_file_id")]
+    except (TypeError, ValueError, json.JSONDecodeError, KeyError):
+        pass
+    file_id = row["telegram_file_id"] if "telegram_file_id" in row.keys() else None
+    if not file_id:
+        return []
+    return [{
+        "kind": row["kind"], "telegram_file_id": file_id,
+        "mime_type": row["mime_type"] if "mime_type" in row.keys() else None,
+        "file_name": row["file_name"] if "file_name" in row.keys() else None,
+    }]
+
+
 class MiniAppService:
     """Authenticated HTTP API and static UI for the Telegram Mini App."""
 
@@ -335,6 +352,7 @@ class MiniAppService:
                                i.file_size, i.media_type, i.sender_name, i.source_chat_title, i.created_at,
                                i.sender_username, i.is_forwarded, i.link_domain, i.mime_type, i.duration, i.width, i.height,
                                i.item_state, i.is_favorite, i.context_text, i.telegram_file_id,
+                               i.media_group_json,
                                i.link_url, i.page_title, f.name AS folder_name, f.emoji AS folder_emoji
                         FROM vault_items i JOIN vault_folders f ON f.id = i.folder_id
                         WHERE {where} ORDER BY i.id DESC"""
@@ -381,15 +399,25 @@ class MiniAppService:
         items = []
         for row in rows:
             item = dict(row)
-            has_photo = item["kind"] == "photo" and bool(item["telegram_file_id"])
+            media_group = _media_group(item)
+            has_photo = item["kind"] == "photo" and bool(media_group)
+            item["has_media"] = bool(media_group)
             item.pop("telegram_file_id", None)
+            item.pop("media_group_json", None)
             item["content"] = (item["content"] or "")[:1800]
             item["context_text"] = (item["context_text"] or "")[:1200]
             item["is_favorite"] = bool(item["is_favorite"])
             item["preview_url"] = f"/api/miniapp/items/{item['id']}/preview" if has_photo else None
+            item["media_count"] = len(media_group)
+            item["media_items"] = [
+                {"kind": media["kind"], "mime_type": media.get("mime_type"), "file_name": media.get("file_name"),
+                 "preview_url": f"/api/miniapp/items/{item['id']}/preview?index={index}" if media["kind"] == "photo" else None}
+                for index, media in enumerate(media_group)
+            ] if len(media_group) > 1 else []
             is_image = has_photo or (item["kind"] == "document" and item.get("mime_type") in {"image/jpeg", "image/png", "image/webp"})
             item["ocr_available"] = bool(is_image and is_owner_user(user_id, self.settings) and self.settings.chatgpt_ocr_url and self.settings.chatgpt_ocr_token)
-            item["has_media"] = bool(item.get("telegram_file_id"))
+            if item["kind"] == "voice" and media_group:
+                item["media_url"] = self._signed_media_url(user_id, int(item["id"]), 0)
             items.append(item)
         return web.json_response(
             {"items": items, "total": total, "page": page, "page_size": page_size},
@@ -405,7 +433,7 @@ class MiniAppService:
                 """SELECT i.id, i.kind, i.content, i.tag, i.manual_tag, i.file_name,
                           i.file_size, i.media_type, i.mime_type, i.duration, i.width, i.height,
                           i.sender_name, i.sender_username, i.is_forwarded, i.source_chat_title, i.created_at,
-                          i.item_state, i.is_favorite, i.context_text, i.telegram_file_id,
+                          i.item_state, i.is_favorite, i.context_text, i.telegram_file_id, i.media_group_json,
                           i.link_url, i.page_title, i.link_domain,
                           f.name AS folder_name, f.emoji AS folder_emoji
                    FROM vault_items i JOIN vault_folders f ON f.id = i.folder_id
@@ -417,15 +445,25 @@ class MiniAppService:
         if not row:
             raise web.HTTPNotFound(text="Материал не найден.")
         item = dict(row)
-        has_photo = item["kind"] == "photo" and bool(item["telegram_file_id"])
-        item["has_media"] = bool(item["telegram_file_id"])
+        media_group = _media_group(item)
+        has_photo = item["kind"] == "photo" and bool(media_group)
+        item["has_media"] = bool(media_group)
         item["preview_url"] = f"/api/miniapp/items/{item_id}/preview" if has_photo else None
+        item["media_count"] = len(media_group)
+        item["media_items"] = [
+            {"kind": media["kind"], "mime_type": media.get("mime_type"), "file_name": media.get("file_name"),
+             "preview_url": f"/api/miniapp/items/{item_id}/preview?index={index}" if media["kind"] == "photo" else None}
+            for index, media in enumerate(media_group)
+        ] if len(media_group) > 1 else []
+        if item["kind"] in {"voice", "audio"} and media_group:
+            item["media_url"] = self._signed_media_url(user_id, item_id, 0)
         is_image = has_photo or (item["kind"] == "document" and item.get("mime_type") in {"image/jpeg", "image/png", "image/webp"})
         item["ocr_available"] = bool(is_image and is_owner_user(user_id, self.settings) and self.settings.chatgpt_ocr_url and self.settings.chatgpt_ocr_token)
         item["content"] = (item["content"] or "")[:1800]
         item["context_text"] = (item["context_text"] or "")[:1200]
         item["is_favorite"] = bool(item["is_favorite"])
         item.pop("telegram_file_id", None)
+        item.pop("media_group_json", None)
         return web.json_response({"item": item}, headers={"Cache-Control": "no-store"})
 
     async def bulk_action(self, request: web.Request) -> web.Response:
@@ -450,7 +488,7 @@ class MiniAppService:
             placeholders = ",".join("?" for _ in item_ids)
             rows = conn.execute(
                 f"""SELECT id, folder_id, tag, manual_tag, archive_chat_id,
-                          archive_message_id, context_message_id
+                          archive_message_id, archive_message_ids, context_message_id
                    FROM vault_items WHERE user_id = ? AND id IN ({placeholders})""",
                 [user_id, *item_ids],
             ).fetchall()
@@ -531,7 +569,13 @@ class MiniAppService:
         if action == "delete":
             for row in rows:
                 chat_id = int(row["archive_chat_id"] or user_id)
-                for message_id in (row["context_message_id"], row["archive_message_id"]):
+                try:
+                    archive_ids = [int(value) for value in json.loads(row["archive_message_ids"] or "[]")]
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    archive_ids = []
+                if not archive_ids and row["archive_message_id"]:
+                    archive_ids = [int(row["archive_message_id"])]
+                for message_id in ([row["context_message_id"]] if row["context_message_id"] else []) + archive_ids:
                     if not message_id:
                         continue
                     telegram_messages_total += 1
@@ -557,16 +601,21 @@ class MiniAppService:
         conn = get_connection()
         try:
             row = conn.execute(
-                "SELECT telegram_file_id, kind, mime_type FROM vault_items WHERE user_id = ? AND id = ?",
+                "SELECT telegram_file_id, media_group_json, kind, mime_type FROM vault_items WHERE user_id = ? AND id = ?",
                 (user_id, item_id),
             ).fetchone()
         finally:
             conn.close()
-        if not row or row["kind"] != "photo" or not row["telegram_file_id"]:
+        try:
+            index = max(0, min(int(request.query.get("index", "0")), 9))
+        except ValueError:
+            raise web.HTTPBadRequest(text="Номер фото некорректен.")
+        media_group = _media_group(row) if row else []
+        if not row or row["kind"] != "photo" or index >= len(media_group) or media_group[index].get("kind") != "photo":
             raise web.HTTPNotFound(text="Фото не найдено.")
 
         try:
-            telegram_file = await self.bot.get_file(row["telegram_file_id"])
+            telegram_file = await self.bot.get_file(media_group[index]["telegram_file_id"])
             if not telegram_file.file_path:
                 raise RuntimeError("Telegram returned no file path")
             url = f"https://api.telegram.org/file/bot{self.settings.bot_token}/{telegram_file.file_path}"
@@ -624,24 +673,28 @@ class MiniAppService:
             raise web.HTTPBadGateway(text="Не удалось распознать текст. Попробуй ещё раз.")
         return web.json_response({"text": text}, headers={"Cache-Control": "no-store"})
 
+    def _signed_media_url(self, user_id: int, item_id: int, index: int = 0) -> str:
+        expires = int(time.time()) + 900
+        payload = f"{user_id}:{item_id}:{index}:{expires}".encode()
+        signature = hmac.new(self.settings.bot_token.encode(), payload, hashlib.sha256).hexdigest()
+        return f"/api/miniapp/media/{user_id}/{item_id}?index={index}&expires={expires}&signature={signature}"
+
     async def media_link(self, request: web.Request) -> web.Response:
         user_id = self._authenticated_user_id(request)
         item_id = int(request.match_info["item_id"])
         conn = get_connection()
         try:
             row = conn.execute(
-                "SELECT telegram_file_id FROM vault_items WHERE user_id = ? AND id = ?",
+                "SELECT telegram_file_id, media_group_json, kind, mime_type, file_name FROM vault_items WHERE user_id = ? AND id = ?",
                 (user_id, item_id),
             ).fetchone()
         finally:
             conn.close()
-        if not row or not row["telegram_file_id"]:
+        media_group = _media_group(row) if row else []
+        if not row or not media_group:
             raise web.HTTPNotFound(text="Файл у этого материала не найден.")
-        expires = int(time.time()) + 900
-        payload = f"{user_id}:{item_id}:{expires}".encode()
-        signature = hmac.new(self.settings.bot_token.encode(), payload, hashlib.sha256).hexdigest()
-        url = f"/api/miniapp/media/{user_id}/{item_id}?expires={expires}&signature={signature}"
-        return web.json_response({"url": url}, headers={"Cache-Control": "no-store"})
+        urls = [self._signed_media_url(user_id, item_id, index) for index in range(len(media_group))]
+        return web.json_response({"url": urls[0], "urls": urls}, headers={"Cache-Control": "no-store"})
 
     async def stream_media(self, request: web.Request) -> web.StreamResponse:
         try:
@@ -649,29 +702,35 @@ class MiniAppService:
             item_id = int(request.match_info["item_id"])
             expires = int(request.query["expires"])
             signature = request.query["signature"]
+            index = max(0, int(request.query.get("index", "0")))
         except (ValueError, KeyError):
             raise web.HTTPUnauthorized(text="Ссылка на файл некорректна.")
         now = int(time.time())
         if expires < now or expires > now + 900:
             raise web.HTTPUnauthorized(text="Ссылка на файл устарела. Открой материал заново.")
-        payload = f"{user_id}:{item_id}:{expires}".encode()
+        payload = f"{user_id}:{item_id}:{index}:{expires}".encode()
         expected = hmac.new(self.settings.bot_token.encode(), payload, hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(expected, signature):
+        # Accept previously issued single-file links for the rest of their short TTL.
+        legacy_payload = f"{user_id}:{item_id}:{expires}".encode()
+        legacy_expected = hmac.new(self.settings.bot_token.encode(), legacy_payload, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, signature) and not ("index" not in request.query and hmac.compare_digest(legacy_expected, signature)):
             raise web.HTTPUnauthorized(text="Ссылка на файл недействительна.")
 
         conn = get_connection()
         try:
             row = conn.execute(
-                "SELECT telegram_file_id, mime_type, file_name FROM vault_items WHERE user_id = ? AND id = ?",
+                "SELECT telegram_file_id, media_group_json, kind, mime_type, file_name FROM vault_items WHERE user_id = ? AND id = ?",
                 (user_id, item_id),
             ).fetchone()
         finally:
             conn.close()
-        if not row or not row["telegram_file_id"]:
+        media_group = _media_group(row) if row else []
+        if not row or index >= len(media_group):
             raise web.HTTPNotFound(text="Файл не найден.")
 
         try:
-            telegram_file = await self.bot.get_file(row["telegram_file_id"])
+            media_file = media_group[index]
+            telegram_file = await self.bot.get_file(media_file["telegram_file_id"])
             if not telegram_file.file_path:
                 raise RuntimeError("Telegram returned no file path")
             url = f"https://api.telegram.org/file/bot{self.settings.bot_token}/{telegram_file.file_path}"
@@ -683,7 +742,9 @@ class MiniAppService:
                         raise RuntimeError(f"Telegram file server returned {upstream.status}")
                     content_type = upstream.headers.get("Content-Type") or ""
                     if not content_type or content_type.split(";", 1)[0].lower() == "application/octet-stream":
-                        content_type = row["mime_type"] or mimetypes.guess_type(telegram_file.file_path)[0] or content_type
+                        content_type = media_file.get("mime_type") or row["mime_type"] or mimetypes.guess_type(telegram_file.file_path)[0] or content_type
+                    if row["kind"] == "voice" and content_type.split(";", 1)[0].lower() not in {"audio/ogg", "audio/opus"}:
+                        content_type = "audio/ogg; codecs=opus"
                     content_type = content_type or "application/octet-stream"
                     inline_types = {
                         "application/pdf", "audio/aac", "audio/mp4", "audio/mpeg", "audio/ogg",
