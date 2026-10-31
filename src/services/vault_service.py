@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta
 from typing import Iterable
 
@@ -694,6 +695,75 @@ class VaultService:
         )
         conn.commit()
         row = conn.execute("SELECT * FROM vault_items WHERE id = ?", (item_id,)).fetchone()
+        conn.close()
+        return row
+
+    @staticmethod
+    def propose_item_ocr(user_id: int, item_id: int, text: str, image_index: int) -> bool:
+        text = str(text or "").strip()[:20_000]
+        if not text:
+            return False
+        conn = get_connection()
+        cursor = conn.execute(
+            """UPDATE vault_items SET ocr_pending_text = ?, ocr_pending_image_index = ?
+               WHERE user_id = ? AND id = ?""",
+            (text, max(0, int(image_index)), user_id, item_id),
+        )
+        conn.commit()
+        changed = cursor.rowcount > 0
+        conn.close()
+        return changed
+
+    @staticmethod
+    def accept_item_ocr(user_id: int, item_id: int):
+        conn = get_connection()
+        row = conn.execute(
+            "SELECT * FROM vault_items WHERE user_id = ? AND id = ?",
+            (user_id, item_id),
+        ).fetchone()
+        if not row or not row["ocr_pending_text"]:
+            conn.close()
+            return None
+        try:
+            results = json.loads(row["ocr_results_json"] or "{}")
+            if not isinstance(results, dict):
+                results = {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            results = {}
+        image_index = max(0, int(row["ocr_pending_image_index"] or 0))
+        results[str(image_index)] = str(row["ocr_pending_text"]).strip()[:20_000]
+        combined = "\n\n".join(
+            f"Фото {int(index) + 1}:\n{value}"
+            for index, value in sorted(results.items(), key=lambda entry: int(entry[0]))
+            if str(value).strip()
+        )[:40_000]
+        conn.execute(
+            """UPDATE vault_items SET ocr_text = ?, ocr_results_json = ?,
+                      ocr_pending_text = NULL, ocr_pending_image_index = NULL
+               WHERE user_id = ? AND id = ?""",
+            (combined, json.dumps(results, ensure_ascii=False), user_id, item_id),
+        )
+        conn.commit()
+        updated = conn.execute(
+            "SELECT * FROM vault_items WHERE user_id = ? AND id = ?",
+            (user_id, item_id),
+        ).fetchone()
+        conn.close()
+        return updated
+
+    @staticmethod
+    def cancel_item_ocr(user_id: int, item_id: int):
+        conn = get_connection()
+        conn.execute(
+            """UPDATE vault_items SET ocr_pending_text = NULL, ocr_pending_image_index = NULL
+               WHERE user_id = ? AND id = ?""",
+            (user_id, item_id),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM vault_items WHERE user_id = ? AND id = ?",
+            (user_id, item_id),
+        ).fetchone()
         conn.close()
         return row
 

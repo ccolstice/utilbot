@@ -190,8 +190,8 @@
     if (photos.length > 1) {
       state.mediaViewerItems = photos.map((media, photoIndex) => ({
         ...item,
-        preview_url: media.preview_url || `/api/miniapp/items/${item.id}/preview?index=${photoIndex}`,
-        viewer_index: photoIndex,
+        preview_url: media.preview_url || `/api/miniapp/items/${item.id}/preview?index=${media.index ?? photoIndex}`,
+        viewer_index: media.index ?? photoIndex,
         viewer_count: photos.length,
       }));
       index = albumIndex ?? 0;
@@ -254,7 +254,7 @@
     const stateLabels = { inbox: "Входящие", later: "На потом", saved: "Разобрано", done: "Готово" };
     const albumPhotos = item.media_items?.filter((media) => media.kind === "photo") || [];
     let media = "";
-    if (albumPhotos.length > 1) media = `<div class="album-gallery">${albumPhotos.map((photo, index) => `<button type="button" class="album-thumb" data-album-index="${index}" aria-label="Открыть фото ${index + 1} из ${albumPhotos.length}"><img data-preview="${item.id}" data-preview-index="${index}" alt="Фото ${index + 1}" loading="lazy"></button>`).join("")}</div><p class="action-note">Альбом · ${albumPhotos.length} фото</p>`;
+    if (albumPhotos.length > 1) media = `<div class="album-gallery">${albumPhotos.map((photo, index) => `<button type="button" class="album-thumb" data-album-index="${index}" aria-label="Открыть фото ${index + 1} из ${albumPhotos.length}"><img data-preview="${item.id}" data-preview-index="${photo.index ?? index}" alt="Фото ${index + 1}" loading="lazy"></button>`).join("")}</div><p class="action-note">Альбом · ${albumPhotos.length} фото</p>`;
     else if (item.preview_url) media = `<img class="detail-image" data-preview="${item.id}" alt="Фото">`;
     else if (item.has_media && ["video", "video_note", "animation"].includes(item.kind)) media = `<video class="detail-video" data-media controls playsinline preload="metadata" aria-label="${escapeHtml(titleFor(item))}"></video>`;
     else if (item.has_media && ["voice", "audio"].includes(item.kind)) media = `<audio class="detail-audio" data-media controls preload="metadata" aria-label="${escapeHtml(titleFor(item))}"></audio>`;
@@ -272,6 +272,8 @@
       ${tags ? `<div class="tag-list detail-tags">${tags}</div>` : ""}
       ${text ? `<div class="detail-text">${escapeHtml(text)}</div>` : ""}
       ${item.context_text ? `<h3>Контекст</h3><div class="detail-text">${escapeHtml(item.context_text)}</div>` : ""}
+      ${item.ocr_text ? `<h3>🧾 Текст с изображений</h3><div class="detail-text">${escapeHtml(item.ocr_text)}</div>` : ""}
+      ${item.ocr_pending_text ? `<section class="ocr-pending"><h3>🔎 Предложение OCR · фото ${Number(item.ocr_pending_image_index || 0) + 1}</h3><pre>${escapeHtml(item.ocr_pending_text)}</pre><div class="form-actions"><button type="button" class="secondary" data-ocr-pending-cancel>Оставить без изменений</button><button type="button" data-ocr-pending-accept>Добавить к материалу</button></div></section>` : ""}
       <div class="detail-actions">
         ${item.ocr_available ? '<button type="button" data-item-action="ocr">🔎 Расшифровать картинку</button>' : ""}
         <button type="button" data-item-action="move">📁 Переместить</button><button type="button" data-item-action="tag">🏷 Тег</button>
@@ -280,6 +282,22 @@
         <button type="button" class="danger-action" data-item-action="delete">🗑 Удалить</button>
       </div>`;
     $("detail-dialog").showModal();
+    const pendingOcr = $("detail-content").querySelector(".ocr-pending");
+    pendingOcr?.querySelector("[data-ocr-pending-accept]")?.addEventListener("click", async (event) => {
+      const target = event.currentTarget; target.disabled = true;
+      try {
+        const data = await api(`/api/miniapp/items/${item.id}/ocr/accept`, { method: "POST" });
+        item.ocr_text = data.ocr_text;
+        let saved = $("detail-content").querySelector("[data-saved-ocr]");
+        if (!saved) { saved = document.createElement("section"); saved.dataset.savedOcr = "true"; saved.innerHTML = "<h3>🧾 Текст с изображений</h3><div class=\"detail-text\"></div>"; pendingOcr.before(saved); }
+        saved.querySelector(".detail-text").textContent = data.ocr_text; toast("Текст добавлен к материалу");
+        pendingOcr.remove();
+      } catch (error) { toast(error.message || "Не удалось сохранить текст"); target.disabled = false; }
+    });
+    pendingOcr?.querySelector("[data-ocr-pending-cancel]")?.addEventListener("click", async () => {
+      try { await api(`/api/miniapp/items/${item.id}/ocr/cancel`, { method: "POST" }); pendingOcr.remove(); toast("Текст не сохранён"); }
+      catch (error) { toast(error.message || "Не удалось отменить предложение"); }
+    });
     const images = $("detail-content").querySelectorAll("img[data-preview]"); images.forEach(fetchPhoto);
     const mediaNode = $("detail-content").querySelector("[data-media]");
     if (mediaNode) api(`/api/miniapp/items/${item.id}/media-link`).then(({ url }) => {
@@ -316,7 +334,7 @@
     if (!result) {
       result = document.createElement("section");
       result.className = "ocr-result";
-      result.innerHTML = '<div class="ocr-result-heading"><strong>Распознанный текст</strong><button type="button" data-ocr-copy>Копировать</button></div><pre data-ocr-text></pre>';
+      result.innerHTML = '<h3>Расшифровать фото</h3><div class="ocr-image-picker" data-ocr-picker></div><div class="ocr-proposal" data-ocr-proposal hidden><div class="ocr-result-heading"><strong>Предложение распознавания</strong><button type="button" data-ocr-copy>Копировать</button></div><pre data-ocr-text></pre><div class="form-actions"><button type="button" class="secondary" data-ocr-cancel>Оставить без изменений</button><button type="button" data-ocr-accept>Добавить к материалу</button></div></div>';
       container.append(result);
       result.querySelector("[data-ocr-copy]").addEventListener("click", async () => {
         const text = result.querySelector("[data-ocr-text]").textContent;
@@ -324,18 +342,51 @@
         catch { toast("Не удалось скопировать текст"); }
       });
     }
+    const photos = (item.media_items || []).map((media) => ({ ...media, index: media.index ?? 0 })).filter((media) => media.kind === "photo");
+    const choices = photos.length ? photos : [{ index: 0, kind: "photo" }];
+    const picker = result.querySelector("[data-ocr-picker]");
+    picker.replaceChildren();
+    choices.forEach((photo, index) => {
+      const choose = document.createElement("button");
+      choose.type = "button";
+      choose.textContent = choices.length > 1 ? `Расшифровать фото ${index + 1}` : "Расшифровать фото";
+      choose.addEventListener("click", () => run(photo.index, index + 1, choose));
+      picker.append(choose);
+    });
+    const proposal = result.querySelector("[data-ocr-proposal]");
+    result.querySelector("[data-ocr-cancel]").onclick = async () => {
+      try { await api(`/api/miniapp/items/${item.id}/ocr/cancel`, { method: "POST" }); proposal.hidden = true; toast("Текст не сохранён"); }
+      catch (error) { toast(error.message || "Не удалось отменить предложение"); }
+    };
+    result.querySelector("[data-ocr-accept]").onclick = async () => {
+      const accept = result.querySelector("[data-ocr-accept]"); accept.disabled = true;
+      try {
+        const data = await api(`/api/miniapp/items/${item.id}/ocr/accept`, { method: "POST" });
+        item.ocr_text = data.ocr_text;
+        let saved = container.querySelector("[data-saved-ocr]");
+        if (!saved) { saved = document.createElement("section"); saved.dataset.savedOcr = "true"; saved.innerHTML = "<h3>🧾 Текст с изображений</h3><div class=\"detail-text\"></div>"; result.before(saved); }
+        saved.querySelector(".detail-text").textContent = data.ocr_text;
+        proposal.hidden = true; toast("Текст добавлен к материалу");
+      } catch (error) { toast(error.message || "Не удалось сохранить текст"); }
+      finally { accept.disabled = false; }
+    };
     result.hidden = false;
-    result.querySelector("[data-ocr-text]").textContent = "Распознаю…";
-    button.disabled = true;
-    button.textContent = "⏳ Распознаю…";
-    try {
-      const data = await api(`/api/miniapp/items/${item.id}/ocr`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
-      result.querySelector("[data-ocr-text]").textContent = data.text;
-    } catch (error) {
-      result.querySelector("[data-ocr-text]").textContent = error.message || "Не удалось распознать текст.";
-    } finally {
-      if (button.isConnected) { button.disabled = false; button.textContent = "🔎 Расшифровать картинку"; }
+    async function run(imageIndex, photoNumber, choose) {
+      const allButtons = picker.querySelectorAll("button"); allButtons.forEach((node) => { node.disabled = true; });
+      choose.textContent = `⏳ Распознаю фото ${photoNumber}…`;
+      proposal.hidden = false;
+      result.querySelector("[data-ocr-text]").textContent = "Распознаю…";
+      try {
+        const data = await api(`/api/miniapp/items/${item.id}/ocr`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ index: imageIndex }) });
+        result.querySelector("[data-ocr-text]").textContent = data.text;
+      } catch (error) {
+        result.querySelector("[data-ocr-text]").textContent = error.message || "Не удалось распознать текст.";
+      } finally {
+        allButtons.forEach((node) => { node.disabled = false; });
+        choose.textContent = choices.length > 1 ? `Расшифровать фото ${photoNumber}` : "Расшифровать фото";
+      }
     }
+    button.scrollIntoView({ block: "nearest" });
   }
 
   function showAction(action, overrideIds = null, favoriteValue = null) {

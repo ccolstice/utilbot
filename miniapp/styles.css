@@ -105,6 +105,10 @@ body.selecting .selection-check { display: grid; }
 .detail-actions button { min-width: 0; padding: 11px 8px; border: 1px solid var(--line); border-radius: 11px; background: var(--bg); color: var(--text); font-size: 12px; font-weight: 700; }
 .detail-actions .danger-action { color: var(--danger); }
 .ocr-result { margin-top: 14px; padding: 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--bg); }
+.ocr-pending { margin-top: 14px; padding: 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--bg); }
+.ocr-image-picker { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.ocr-image-picker button { min-height: 40px; }
+.ocr-pending pre { max-height: 30vh; overflow: auto; overflow-wrap: anywhere; white-space: pre-wrap; font: inherit; }
 .ocr-result-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
 .ocr-result-heading button { padding: 7px 10px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface); color: var(--text); font-weight: 700; }
 .ocr-result pre { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; font: inherit; }

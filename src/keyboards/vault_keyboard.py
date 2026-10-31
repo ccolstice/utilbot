@@ -467,6 +467,8 @@ def item_view_keyboard(
     ai_undo_callback: str | None = None,
     ai_accept_callback: str | None = None,
     ai_cancel_callback: str | None = None,
+    ocr_accept_callback: str | None = None,
+    ocr_cancel_callback: str | None = None,
     ai_callback_label: str = "✨ Обработать через ChatGPT",
 ) -> InlineKeyboardMarkup:
     rows = []
@@ -491,6 +493,10 @@ def item_view_keyboard(
 
     if ocr_callback:
         rows.append([InlineKeyboardButton(text="🔎 Расшифровать картинку", callback_data=ocr_callback)])
+    if ocr_accept_callback:
+        rows.append([InlineKeyboardButton(text="✅ Добавить текст к материалу", callback_data=ocr_accept_callback)])
+    if ocr_cancel_callback:
+        rows.append([InlineKeyboardButton(text="✖️ Отменить OCR", callback_data=ocr_cancel_callback)])
     if ai_callback:
         rows.append([InlineKeyboardButton(text=ai_callback_label, callback_data=ai_callback)])
     if ai_accept_callback:
