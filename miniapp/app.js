@@ -23,7 +23,6 @@
     if (item.kind === "link") return item.page_title || item.link_domain || "Ссылка";
     return item.file_name || item.page_title || ({ photo: "Фото", document: "Файл", video: "Видео", voice: "Голосовое", audio: "Аудио", sticker: "Стикер", animation: "GIF", video_note: "Видеосообщение" }[item.kind] || item.content || "Материал");
   }
-  function kindIcon(kind) { return ({ photo: "▧", text: "≡", link: "↗", document: "▤", video: "▶", animation: "▧", sticker: "◉", voice: "◖", audio: "♫", video_note: "◉" })[kind] || "▤"; }
   function tagsOf(item) { return String(item.tag || "").split(",").map((tag) => tag.trim()).filter(Boolean).slice(0, 2); }
   function toast(message) {
     const node = $("toast"); node.textContent = message; node.classList.add("visible");
@@ -110,14 +109,15 @@
       const tags = tagsOf(item).map((tag) => `<span class="tag-pill">#${escapeHtml(tag)}</span>`).join("");
       const title = titleFor(item);
       const isText = item.kind === "text";
+      const hasImage = Boolean(item.preview_url);
       const excerpt = item.content ? `<div class="card-excerpt">${escapeHtml(String(item.content).trim())}</div>` : "";
       const audioPlayer = item.kind === "voice" && item.media_url
         ? `<audio class="card-audio" controls preload="none" src="${escapeHtml(item.media_url)}" aria-label="Слушать голосовое"></audio>` : "";
       const albumBadge = item.media_count > 1 ? `<span class="album-count">▧ ${item.media_count}</span>` : "";
-      const preview = item.preview_url
+      const preview = hasImage
         ? `<div class="item-preview"><img data-preview="${item.id}" alt="Превью материала" loading="lazy">${albumBadge}</div>`
-        : isText ? "" : `<div class="item-preview"><span class="preview-placeholder">${kindIcon(item.kind)}</span>${albumBadge}</div>`;
-      return `<article class="item-card${isText ? " text-card" : ""}${selected ? " selected" : ""}" data-id="${item.id}" tabindex="0" role="button" aria-label="${escapeHtml(title)}">
+        : "";
+      return `<article class="item-card${hasImage ? " image-card" : " compact-card"}${isText ? " text-card" : ""}${selected ? " selected" : ""}" data-id="${item.id}" tabindex="0" role="button" aria-label="${escapeHtml(title)}">
         <span class="selection-check" aria-hidden="true">${selected ? "✓" : ""}</span>
         ${item.is_favorite ? '<span class="favorite-mark" aria-label="В избранном">⭐</span>' : ""}
         ${preview}<div class="card-body"><div class="card-title">${escapeHtml(title)}</div>
@@ -139,11 +139,35 @@
   function layoutMasonryCards() {
     const cards = Array.from(grid.querySelectorAll(".item-card"));
     grid.classList.remove("masonry-ready");
-    for (const card of cards) card.style.removeProperty("--row-span");
+    for (const card of cards) {
+      card.style.removeProperty("--row-span");
+      if (card.classList.contains("compact-card")) {
+        card.style.removeProperty("height");
+        card.style.removeProperty("min-height");
+        card.style.removeProperty("max-height");
+      }
+    }
     const rowHeight = 6;
     const rowGap = Number.parseFloat(getComputedStyle(grid).rowGap) || 0;
     grid.style.setProperty("--masonry-row-height", `${rowHeight}px`);
     grid.style.setProperty("--masonry-row-gap", `${rowGap}px`);
+    const imageCards = cards.filter((card) => card.classList.contains("image-card"));
+    const imageHeights = imageCards.map((card) => card.getBoundingClientRect().height).filter((height) => height > 0).sort((a, b) => a - b);
+    const columns = Math.max(1, getComputedStyle(grid).gridTemplateColumns.split(" ").length);
+    const columnGap = Number.parseFloat(getComputedStyle(grid).columnGap) || 0;
+    const cellWidth = (grid.clientWidth - columnGap * (columns - 1)) / columns;
+    const estimatedImageHeight = cellWidth / 1.25 + 124;
+    const referenceImageHeight = imageHeights.length
+      ? imageHeights[Math.floor(imageHeights.length / 2)]
+      : estimatedImageHeight;
+    const compactHeight = Math.max(96, (referenceImageHeight - rowGap) / 2);
+    grid.style.setProperty("--compact-card-height", `${compactHeight}px`);
+    for (const card of cards) {
+      if (!card.classList.contains("compact-card")) continue;
+      card.style.height = `${compactHeight}px`;
+      card.style.minHeight = `${compactHeight}px`;
+      card.style.maxHeight = `${compactHeight}px`;
+    }
     for (const card of cards) {
       const height = card.getBoundingClientRect().height;
       const span = Math.max(1, Math.ceil((height + rowGap) / (rowHeight + rowGap)));
