@@ -35,7 +35,9 @@ def _media_group(row) -> list[dict]:
     try:
         value = json.loads(row["media_group_json"] or "[]")
         if isinstance(value, list):
-            return [entry for entry in value if isinstance(entry, dict) and entry.get("telegram_file_id")]
+            entries = [entry for entry in value if isinstance(entry, dict) and entry.get("telegram_file_id")]
+            if entries:
+                return entries
     except (TypeError, ValueError, json.JSONDecodeError, KeyError):
         pass
     file_id = row["telegram_file_id"] if "telegram_file_id" in row.keys() else None
@@ -46,6 +48,13 @@ def _media_group(row) -> list[dict]:
         "mime_type": row["mime_type"] if "mime_type" in row.keys() else None,
         "file_name": row["file_name"] if "file_name" in row.keys() else None,
     }]
+
+
+def _is_image_media(media: dict) -> bool:
+    return media.get("kind") == "photo" or (
+        media.get("kind") == "document"
+        and media.get("mime_type") in {"image/jpeg", "image/png", "image/webp"}
+    )
 
 
 class MiniAppService:
@@ -403,7 +412,7 @@ class MiniAppService:
         for row in rows:
             item = dict(row)
             media_group = _media_group(item)
-            has_photo = item["kind"] == "photo" and bool(media_group)
+            has_photo = any(_is_image_media(media) for media in media_group)
             item["has_media"] = bool(media_group)
             item.pop("telegram_file_id", None)
             item.pop("media_group_json", None)
@@ -416,7 +425,7 @@ class MiniAppService:
             item["media_count"] = len(media_group)
             item["media_items"] = [
                 {"index": index, "kind": media["kind"], "mime_type": media.get("mime_type"), "file_name": media.get("file_name"),
-                 "preview_url": f"/api/miniapp/items/{item['id']}/preview?index={index}" if media["kind"] == "photo" else None}
+                 "preview_url": f"/api/miniapp/items/{item['id']}/preview?index={index}" if _is_image_media(media) else None}
                 for index, media in enumerate(media_group)
             ] if len(media_group) > 1 else []
             is_image = has_photo or (item["kind"] == "document" and item.get("mime_type") in {"image/jpeg", "image/png", "image/webp"})
@@ -452,13 +461,13 @@ class MiniAppService:
             raise web.HTTPNotFound(text="Материал не найден.")
         item = dict(row)
         media_group = _media_group(item)
-        has_photo = item["kind"] == "photo" and bool(media_group)
+        has_photo = any(_is_image_media(media) for media in media_group)
         item["has_media"] = bool(media_group)
         item["preview_url"] = f"/api/miniapp/items/{item_id}/preview" if has_photo else None
         item["media_count"] = len(media_group)
         item["media_items"] = [
             {"index": index, "kind": media["kind"], "mime_type": media.get("mime_type"), "file_name": media.get("file_name"),
-             "preview_url": f"/api/miniapp/items/{item_id}/preview?index={index}" if media["kind"] == "photo" else None}
+             "preview_url": f"/api/miniapp/items/{item_id}/preview?index={index}" if _is_image_media(media) else None}
             for index, media in enumerate(media_group)
         ] if len(media_group) > 1 else []
         if item["kind"] in {"voice", "audio"} and media_group:
@@ -619,7 +628,7 @@ class MiniAppService:
         except ValueError:
             raise web.HTTPBadRequest(text="Номер фото некорректен.")
         media_group = _media_group(row) if row else []
-        if not row or row["kind"] != "photo" or index >= len(media_group) or media_group[index].get("kind") != "photo":
+        if not row or index >= len(media_group) or not _is_image_media(media_group[index]):
             raise web.HTTPNotFound(text="Фото не найдено.")
 
         try:

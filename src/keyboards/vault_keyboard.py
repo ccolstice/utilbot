@@ -460,7 +460,7 @@ def item_view_keyboard(
     actions_callback: str | None = None,
     delete_callback: str | None = None,
     review_next_callback: str | None = None,
-    review_move_callback: str | None = None,
+    move_callback: str | None = None,
     ocr_callback: str | None = None,
     ai_callback: str | None = None,
     ai_retry_callback: str | None = None,
@@ -483,10 +483,10 @@ def item_view_keyboard(
     elif favorite_button:
         rows.append([favorite_button])
 
-    if review_move_callback or review_next_callback:
+    if move_callback or review_next_callback:
         review_row = []
-        if review_move_callback:
-            review_row.append(InlineKeyboardButton(text="📁 В папку", callback_data=review_move_callback))
+        if move_callback:
+            review_row.append(InlineKeyboardButton(text="📁 В папку", callback_data=move_callback))
         if review_next_callback:
             review_row.append(InlineKeyboardButton(text="⏭ Пропустить", callback_data=review_next_callback))
         rows.append(review_row)

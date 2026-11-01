@@ -1255,7 +1255,7 @@ async def show_item_view(
         actions_callback=f"item_more_{item_id}",
         delete_callback=delete_callback,
         review_next_callback=f"review_skip_{item_id}" if origin == "review" else None,
-        review_move_callback=move_callback if origin == "review" else None,
+        move_callback=move_callback,
         ocr_callback=(
             f"item_ocr_{item_id}"
             if image_entries
@@ -1681,7 +1681,7 @@ async def item_more_actions_handler(callback: CallbackQuery):
         return
 
     markup = item_actions_keyboard(
-        move_callback=None if data.get("origin") == "review" else data["move_callback"],
+        move_callback=None,
         tag_callback=data["tag_callback"],
         remind_callback=data["remind_callback"],
         context_callback=data.get("context_callback"),
