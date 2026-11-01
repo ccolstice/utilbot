@@ -125,6 +125,7 @@
         <div class="card-meta"><span class="card-folder">${escapeHtml(item.folder_emoji || "📁")} ${escapeHtml(item.folder_name)}</span><time>${escapeHtml(displayDate(item.created_at))}</time></div>
         ${tags ? `<div class="tag-list">${tags}</div>` : ""}</div></article>`;
     }).join("");
+    layoutMasonryCards();
     grid.querySelectorAll(".item-card").forEach((card) => {
       card.addEventListener("click", () => onCardClick(Number(card.dataset.id)));
       card.querySelector("audio")?.addEventListener("click", (event) => event.stopPropagation());
@@ -135,6 +136,26 @@
     });
     observePhotos();
   }
+  function layoutMasonryCards() {
+    const cards = Array.from(grid.querySelectorAll(".item-card"));
+    grid.classList.remove("masonry-ready");
+    for (const card of cards) card.style.removeProperty("--row-span");
+    const rowHeight = 6;
+    const rowGap = Number.parseFloat(getComputedStyle(grid).rowGap) || 0;
+    grid.style.setProperty("--masonry-row-height", `${rowHeight}px`);
+    grid.style.setProperty("--masonry-row-gap", `${rowGap}px`);
+    for (const card of cards) {
+      const height = card.getBoundingClientRect().height;
+      const span = Math.max(1, Math.ceil((height + rowGap) / (rowHeight + rowGap)));
+      card.style.setProperty("--row-span", span);
+    }
+    grid.classList.add("masonry-ready");
+  }
+  let masonryResizeTimer;
+  window.addEventListener("resize", () => {
+    clearTimeout(masonryResizeTimer);
+    masonryResizeTimer = setTimeout(layoutMasonryCards, 80);
+  });
   const photoObserver = new IntersectionObserver((entries) => {
     for (const entry of entries) if (entry.isIntersecting) { photoObserver.unobserve(entry.target); fetchPhoto(entry.target); }
   }, { rootMargin: "180px" });
@@ -149,7 +170,7 @@
     } catch { image.parentElement.innerHTML = '<span class="preview-placeholder">▧</span>'; }
   }
   function isVisualItem(item) {
-    return item?.kind === "photo" || item?.media_items?.some((media) => media.kind === "photo") || (item?.kind === "sticker" && item.mime_type === "image/webp");
+    return Boolean(item?.preview_url) || item?.media_items?.some((media) => Boolean(media.preview_url)) || (item?.kind === "sticker" && item.mime_type === "image/webp");
   }
   async function showMediaViewerItem(index) {
     const items = state.mediaViewerItems || [];
@@ -185,7 +206,7 @@
     }
   }
   function openMediaViewer(item, albumIndex = null) {
-    const photos = item.media_items?.filter((media) => media.kind === "photo") || [];
+    const photos = item.media_items?.filter((media) => media.preview_url) || [];
     let index;
     if (photos.length > 1) {
       state.mediaViewerItems = photos.map((media, photoIndex) => ({
@@ -252,7 +273,7 @@
     if (!item) return;
     const tags = tagsOf(item).map((tag) => `<span class="tag-pill">#${escapeHtml(tag)}</span>`).join("");
     const stateLabels = { inbox: "Входящие", later: "На потом", saved: "Разобрано", done: "Готово" };
-    const albumPhotos = item.media_items?.filter((media) => media.kind === "photo") || [];
+    const albumPhotos = item.media_items?.filter((media) => media.preview_url) || [];
     let media = "";
     if (albumPhotos.length > 1) media = `<div class="album-gallery">${albumPhotos.map((photo, index) => `<button type="button" class="album-thumb" data-album-index="${index}" aria-label="Открыть фото ${index + 1} из ${albumPhotos.length}"><img data-preview="${item.id}" data-preview-index="${photo.index ?? index}" alt="Фото ${index + 1}" loading="lazy"></button>`).join("")}</div><p class="action-note">Альбом · ${albumPhotos.length} фото</p>`;
     else if (item.preview_url) media = `<img class="detail-image" data-preview="${item.id}" alt="Фото">`;
