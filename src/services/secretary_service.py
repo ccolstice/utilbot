@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import random
@@ -14,6 +15,7 @@ import aiohttp
 
 from src.config import Settings
 from src.db.database import get_connection
+from src.services.chatgpt_ai_service import ChatGptAiService
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +47,7 @@ TINY_CYRILLIC_MAP = str.maketrans({
 })
 
 COMMAND_RE = re.compile(r"^\.(mute|unmute|typing|type|del|spam|hack|flip|tiny)(?:\s+([\s\S]*))?$", re.IGNORECASE)
+AI_MODE_COMMANDS = {".быдло": "bydlo", ".троль": "troll", ".офис": "office", ".все": None}
 DURATION_RE = re.compile(r"^(\d+)(s|sec|сек|m|min|мин|h|час|d|д)?$", re.IGNORECASE)
 TYPE_CHARACTER_INTERVAL = 0.12
 TELEGRAM_TEXT_LIMIT = 4096
@@ -116,6 +119,9 @@ class SecretaryService:
         self.scheduler_task: asyncio.Task | None = None
         self.scheduler_wakeup = asyncio.Event()
         self.chat_write_times: dict[tuple[str, int], float] = {}
+        self.ai_modes: dict[tuple[str, int], str | None] = {}
+        self.ai_reply_locks: dict[tuple[str, int], asyncio.Lock] = {}
+        self.ai_reply_tasks: set[asyncio.Task] = set()
 
     async def _api(self, method: str, data: dict[str, Any] | None = None, *, timeout: int = 40):
         if self.session is None:
@@ -472,6 +478,122 @@ class SecretaryService:
              encoded, int(ignore_delete), time.time()),
         ))
 
+    async def _set_ai_mode(self, connection_id: str, chat_id: int, mode: str | None):
+        key = (connection_id, int(chat_id))
+        if mode is None:
+            await self._db(lambda conn: conn.execute(
+                "DELETE FROM secretary_ai_modes WHERE business_connection_id=? AND chat_id=?", key,
+            ))
+        else:
+            await self._db(lambda conn: conn.execute(
+                "INSERT INTO secretary_ai_modes(business_connection_id, chat_id, mode, updated_at) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(business_connection_id, chat_id) DO UPDATE SET "
+                "mode=excluded.mode, updated_at=excluded.updated_at",
+                (connection_id, int(chat_id), mode, time.time()),
+            ))
+        self.ai_modes[key] = mode
+
+    async def _get_ai_mode(self, connection_id: str, chat_id: int) -> str | None:
+        key = (connection_id, int(chat_id))
+        if key not in self.ai_modes:
+            row = await self._db(lambda conn: conn.execute(
+                "SELECT mode FROM secretary_ai_modes WHERE business_connection_id=? AND chat_id=?",
+                key,
+            ).fetchone())
+            self.ai_modes[key] = str(row["mode"]) if row else None
+        return self.ai_modes[key]
+
+    async def _ai_context(self, connection_id: str, chat_id: int, message_id: int) -> tuple[str, dict[str, Any] | None]:
+        rows = await self._db(lambda conn: conn.execute(
+            "SELECT message_id, message_json FROM secretary_message_snapshots "
+            "WHERE business_connection_id=? AND chat_id=? AND message_id<=? AND updated_at>=? "
+            "ORDER BY updated_at DESC LIMIT 12",
+            (connection_id, int(chat_id), int(message_id), time.time() - 6 * 60 * 60),
+        ).fetchall())
+        lines = []
+        trigger_message = None
+        for row in reversed(rows):
+            try:
+                message = json.loads(row["message_json"])
+            except (TypeError, ValueError):
+                continue
+            if int(row["message_id"]) == int(message_id):
+                trigger_message = message
+            sender = message.get("from") or {}
+            text = str(message.get("text") or message.get("caption") or "").strip()
+            if int(sender.get("id") or 0) == self.owner_id and text.startswith("."):
+                continue
+            if not text:
+                text = self._message_content(message)
+            lines.append(f"{self._sender_name(sender)}: {text[:1200]}")
+        return "\n".join(lines)[-9000:], trigger_message
+
+    async def _secretary_image(self, message: dict[str, Any] | None) -> tuple[str, str]:
+        photos = (message or {}).get("photo") or []
+        if not photos or not isinstance(photos[-1], dict) or not photos[-1].get("file_id"):
+            return "", ""
+        if self.session is None:
+            raise RuntimeError("Secretary Telegram session is not ready")
+        file_info = await self._api("getFile", {"file_id": photos[-1]["file_id"]})
+        if int(file_info.get("file_size") or 0) > 15 * 1024 * 1024:
+            raise ValueError("Фото больше 15 МБ и не передано в ИИ-режим.")
+        file_path = str(file_info.get("file_path") or "")
+        if not file_path:
+            return "", ""
+        async with self.session.get(f"https://api.telegram.org/file/bot{self.token}/{file_path}") as response:
+            if response.status != 200:
+                raise RuntimeError(f"Telegram не отдал фото (HTTP {response.status}).")
+            image = await response.read()
+        if not image or len(image) > 15 * 1024 * 1024:
+            raise ValueError("Фото больше 15 МБ и не передано в ИИ-режим.")
+        lowered = file_path.lower()
+        mime_type = "image/png" if lowered.endswith(".png") else "image/webp" if lowered.endswith(".webp") else "image/jpeg"
+        return base64.b64encode(image).decode("ascii"), mime_type
+
+    async def _queue_ai_reply(self, connection_id: str, chat_id: int, message: dict[str, Any], mode: str):
+        message_id = int(message.get("message_id") or 0)
+        key = (connection_id, int(chat_id))
+        lock = self.ai_reply_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            if await self._get_ai_mode(connection_id, chat_id) != mode:
+                return
+            try:
+                context, trigger_message = await self._ai_context(connection_id, chat_id, message_id)
+                if trigger_message is None:
+                    trigger_message = message
+                    sender = message.get("from") or {}
+                    trigger_text = str(message.get("text") or message.get("caption") or "").strip()
+                    if not trigger_text:
+                        trigger_text = self._message_content(message)
+                    line = f"{self._sender_name(sender)}: {trigger_text[:1200]}"
+                    if line not in context.splitlines():
+                        context = f"{context}\n{line}".strip()
+                if not context:
+                    return
+                started_at = time.perf_counter()
+                image_base64, mime_type = await self._secretary_image(trigger_message)
+                reply = await ChatGptAiService.generate_secretary_reply(
+                    self.settings, self.owner_id, mode, context,
+                    image_base64=image_base64, mime_type=mime_type,
+                )
+                elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+                if await self._get_ai_mode(connection_id, chat_id) != mode:
+                    logger.info("Secretary AI reply discarded after mode changed chat_id=%s", chat_id)
+                    return
+                sent = await self._api("sendMessage", self._with_business(connection_id, {
+                    "chat_id": int(chat_id), "text": reply[:3900],
+                    "reply_parameters": {"message_id": int(message_id), "allow_sending_without_reply": True},
+                }))
+                logger.info("Secretary AI reply delivered chat_id=%s mode=%s elapsed_ms=%s message_id=%s",
+                            chat_id, mode, elapsed_ms, sent.get("message_id"))
+            except Exception:
+                logger.exception("Secretary AI auto-reply failed chat_id=%s mode=%s", chat_id, mode)
+
+    def _start_ai_reply(self, connection_id: str, chat_id: int, message: dict[str, Any], mode: str):
+        task = asyncio.create_task(self._queue_ai_reply(connection_id, chat_id, message, mode))
+        self.ai_reply_tasks.add(task)
+        task.add_done_callback(self.ai_reply_tasks.discard)
+
     async def _save_edited_message(self, update_id: int, message: dict[str, Any]):
         connection_id = str(message.get("business_connection_id") or "")
         chat = message.get("chat") or {}
@@ -772,11 +894,27 @@ class SecretaryService:
             self.active_mutes.pop(mute_key, None)
 
         asyncio.create_task(self._remember_chat_safely(connection_id, chat, message.get("date")))
-        if sender_id != self.owner_id or sender.get("is_bot"):
+        if sender_id == self.owner_id and not sender.get("is_bot"):
+            text = str(message.get("text") or "").strip()
+            mode_command = text.lower()
+            if mode_command in AI_MODE_COMMANDS:
+                mode = AI_MODE_COMMANDS[mode_command]
+                await self._set_ai_mode(connection_id, chat_id, mode)
+                try:
+                    await self._delete_message(connection_id, chat_id, int(message["message_id"]))
+                except TelegramApiError as error:
+                    logger.warning("Secretary AI mode command could not be removed chat_id=%s code=%s: %s",
+                                   chat_id, error.code, error)
+                logger.info("Secretary AI mode changed chat_id=%s mode=%s", chat_id, mode or "off")
+                return
+            if text.startswith("."):
+                await self._execute(text, connection_id, chat_id, source=message)
             return
-        text = str(message.get("text") or "")
-        if text.startswith("."):
-            await self._execute(text, connection_id, chat_id, source=message)
+        if sender.get("is_bot"):
+            return
+        mode = await self._get_ai_mode(connection_id, chat_id)
+        if mode:
+            self._start_ai_reply(connection_id, chat_id, message, mode)
 
     async def _handle_group_message(self, message: dict[str, Any]):
         chat = message.get("chat") or {}
