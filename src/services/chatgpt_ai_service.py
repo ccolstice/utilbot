@@ -26,6 +26,40 @@ def _image_mime(data: bytes, declared_type: str = "") -> str:
 
 class ChatGptAiService:
     @staticmethod
+    async def generate_secretary_reply(settings: Settings, user_id: int, mode: str, context: str,
+                                       *, image_base64: str = "", mime_type: str = "") -> str:
+        if mode not in {"bydlo", "troll", "office"}:
+            raise ValueError("Неизвестный режим ИИ-секретаря.")
+        if not settings.chatgpt_ai_url or not settings.chatgpt_ai_token:
+            raise RuntimeError("Связь секретаря с SIWC не настроена.")
+        timeout = aiohttp.ClientTimeout(total=210, connect=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                settings.chatgpt_ai_url,
+                headers={"Authorization": f"Bearer {settings.chatgpt_ai_token}"},
+                json={
+                    "user_id": user_id,
+                    "record": {
+                        "content": context[:9_000],
+                        "image_base64": image_base64,
+                        "mime_type": mime_type,
+                    },
+                    "mode": f"secretary_{mode}",
+                },
+            ) as response:
+                try:
+                    payload = await response.json(content_type=None)
+                except (ValueError, aiohttp.ContentTypeError):
+                    payload = {}
+                if response.status != 200:
+                    message = str(payload.get("error") or "ChatGPT не смог подготовить ответ.")
+                    raise RuntimeError(message[:500])
+                reply = str(payload.get("reply") or "").strip()
+                if not reply:
+                    raise RuntimeError("ChatGPT вернул пустой ответ.")
+                return reply[:3_900]
+
+    @staticmethod
     def _record(item) -> dict:
         item = dict(item)
         content = item.get("content")

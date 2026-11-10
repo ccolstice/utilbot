@@ -265,6 +265,14 @@ def init_db():
         updated_at REAL NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS secretary_ai_modes (
+        business_connection_id TEXT NOT NULL,
+        chat_id INTEGER NOT NULL,
+        mode TEXT NOT NULL,
+        updated_at REAL NOT NULL,
+        PRIMARY KEY (business_connection_id, chat_id)
+    );
+
     CREATE TABLE IF NOT EXISTS secretary_jobs (
         id TEXT PRIMARY KEY,
         kind TEXT NOT NULL,
