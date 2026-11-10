@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import math
 import re
 import time
 import uuid
@@ -43,6 +42,12 @@ TINY_CYRILLIC_MAP = str.maketrans({
 
 COMMAND_RE = re.compile(r"^\.(mute|unmute|typing|type|del|spam|hack|flip|tiny)(?:\s+([\s\S]*))?$", re.IGNORECASE)
 DURATION_RE = re.compile(r"^(\d+)(s|sec|сек|m|min|мин|h|час|d|д)?$", re.IGNORECASE)
+TYPE_CHARACTER_INTERVAL = 0.12
+TELEGRAM_TEXT_LIMIT = 4096
+
+
+def _telegram_text_units(text: str) -> int:
+    return len(text.encode("utf-16-le")) // 2
 
 
 class TelegramApiError(RuntimeError):
@@ -319,7 +324,8 @@ class SecretaryService:
         if control_chat.get("type") != "private":
             return
         chat_id = int(control_chat.get("id") or 0)
-        text = str(message.get("text") or "").strip()
+        raw_text = str(message.get("text") or "")
+        text = raw_text.strip()
         if not chat_id or not text:
             return
         command = text.split(maxsplit=1)[0].split("@", 1)[0].lower()
@@ -339,7 +345,7 @@ class SecretaryService:
         if not target:
             await self._show_chats(chat_id)
             return
-        await self._execute(text, target["business_connection_id"], int(target["chat_id"]), source=None)
+        await self._execute(raw_text, target["business_connection_id"], int(target["chat_id"]), source=None)
 
     async def _handle_business_message(self, message: dict[str, Any]):
         connection_id = str(message.get("business_connection_id") or "")
@@ -372,7 +378,7 @@ class SecretaryService:
         asyncio.create_task(self._remember_chat_safely(connection_id, chat, message.get("date")))
         if sender_id != self.owner_id or sender.get("is_bot"):
             return
-        text = str(message.get("text") or "").strip()
+        text = str(message.get("text") or "")
         if text.startswith("."):
             await self._execute(text, connection_id, chat_id, source=message)
 
@@ -405,7 +411,7 @@ class SecretaryService:
         asyncio.create_task(self._remember_chat_safely("", chat, message.get("date")))
         if sender_id != self.owner_id:
             return
-        text = str(message.get("text") or "").strip()
+        text = str(message.get("text") or "")
         if text.startswith("."):
             await self._execute(text, "", chat_id, source=message)
 
@@ -487,11 +493,14 @@ class SecretaryService:
         return await self._send_message(connection_id, chat_id, text)
 
     async def _execute(self, command_text: str, connection_id: str, chat_id: int, *, source: dict[str, Any] | None):
-        match = COMMAND_RE.match(command_text.strip())
+        match = COMMAND_RE.match(command_text)
         if not match:
             return
         command = match.group(1).lower()
         args = (match.group(2) or "").strip()
+        if command == "type":
+            type_match = re.match(r"^\.type(?:\s([\s\S]*))?$", command_text, re.IGNORECASE)
+            args = (type_match.group(1) or "") if type_match else args
         now = time.time()
         mute_key = (connection_id, chat_id)
 
@@ -537,13 +546,13 @@ class SecretaryService:
                 return
 
             if command == "type":
-                text = args[:4096]
-                step = max(1, math.ceil(len(text) / 12))
-                first = text[:step]
+                text = args
+                first = text[:1]
                 message_id = await self._edit_or_send(connection_id, chat_id, source, first)
                 if len(first) < len(text) and message_id:
                     await self._create_job("type", connection_id, chat_id, message_id=message_id,
-                        payload={"text": text, "cursor": len(first), "step": step}, next_at=now + 0.5)
+                        payload={"text": text, "cursor": len(first), "segment_start": 0},
+                        next_at=now + TYPE_CHARACTER_INTERVAL)
                 return
 
             if command == "del":
@@ -651,14 +660,39 @@ class SecretaryService:
             if kind == "type":
                 text = str(payload.get("text") or "")
                 cursor = int(payload.get("cursor") or 0)
-                step = max(1, int(payload.get("step") or 1))
-                cursor = min(len(text), cursor + step)
-                await self._edit_message(connection_id, chat_id, message_id, text[:cursor])
+                if cursor >= len(text):
+                    await self._finish_job(job_id)
+                    return
+
+                segment_start = int(payload.get("segment_start") or 0)
+                current_segment = text[segment_start:cursor]
+                next_character = text[cursor]
+                if _telegram_text_units(current_segment) + _telegram_text_units(next_character) > TELEGRAM_TEXT_LIMIT:
+                    # Telegram limits each message to 4096 characters. Continue
+                    # longer input in another message, still one character at a time.
+                    message_id = await self._send_message(connection_id, chat_id, next_character)
+                    segment_start = cursor
+                else:
+                    try:
+                        await self._edit_message(
+                            connection_id, chat_id, message_id, text[segment_start:cursor + 1]
+                        )
+                    except TelegramApiError as error:
+                        # If Telegram applied an edit but its response was lost,
+                        # retrying the same step returns this 400. Treat it as an
+                        # acknowledgement so the persisted cursor can move forward.
+                        if error.code != 400 or "message is not modified" not in str(error).lower():
+                            raise
+                cursor += 1
                 if cursor >= len(text):
                     await self._finish_job(job_id)
                 else:
                     payload["cursor"] = cursor
-                    await self._update_job(job_id, payload=payload, next_at=time.time() + 0.5)
+                    payload["segment_start"] = segment_start
+                    payload.pop("retry_attempts", None)
+                    await self._update_job(job_id, payload=payload,
+                                           next_at=time.time() + TYPE_CHARACTER_INTERVAL,
+                                           message_id=message_id)
                 return
 
             if kind == "hack":
@@ -675,6 +709,14 @@ class SecretaryService:
         except TelegramApiError as error:
             if error.retry_after:
                 await self._update_job(job_id, next_at=time.time() + int(error.retry_after) + 1)
+                return
+            if kind == "type" and isinstance(error.code, int) and error.code >= 500:
+                attempts = int(payload.get("retry_attempts") or 0) + 1
+                payload["retry_attempts"] = attempts
+                await self._update_job(job_id, payload=payload,
+                                       next_at=time.time() + min(30, 2 ** min(attempts, 5)))
+                logger.warning("Retrying .type after Telegram server error chat_id=%s code=%s attempt=%s",
+                               chat_id, error.code, attempts)
                 return
             logger.warning("Secretary scheduled action failed kind=%s chat_id=%s: %s", kind, chat_id, error)
             if kind == "mute":
@@ -710,7 +752,8 @@ class SecretaryService:
                 raise
             except Exception:
                 logger.exception("Secretary scheduler iteration failed")
-            await asyncio.sleep(1)
+            # Timed actions schedule their own next_at. A fixed one-second sleep
+            # here made every .type character wait an extra second.
 
     async def _poll(self, offset: int | None):
         info = await self._api("getWebhookInfo")
