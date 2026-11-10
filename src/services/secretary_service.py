@@ -47,7 +47,13 @@ TINY_CYRILLIC_MAP = str.maketrans({
 })
 
 COMMAND_RE = re.compile(r"^\.(mute|unmute|typing|type|del|spam|hack|flip|tiny)(?:\s+([\s\S]*))?$", re.IGNORECASE)
-AI_MODE_COMMANDS = {".быдло": "bydlo", ".троль": "troll", ".офис": "office", ".все": None}
+AI_MODE_COMMANDS = {
+    ".быдло": "bydlo",
+    ".троль": "troll",
+    ".офис": "office",
+    ".решала": "reshala",
+    ".все": None,
+}
 DURATION_RE = re.compile(r"^(\d+)(s|sec|сек|m|min|мин|h|час|d|д)?$", re.IGNORECASE)
 TYPE_CHARACTER_INTERVAL = 0.12
 TELEGRAM_TEXT_LIMIT = 4096
