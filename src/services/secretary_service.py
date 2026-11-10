@@ -28,6 +28,18 @@ TINY_MAP = str.maketrans({
     **dict(zip("abcdefghijklmnopqrstuvwxyz", "ᴀʙᴄᴅᴇꜰɢʜɪᴊᴋʟᴍɴᴏᴘǫʀꜱᴛᴜᴠᴡxʏᴢ")),
     **dict(zip("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "ABCDEFGHIJKLMNOPQRSTUVWXYZ")),
 })
+TINY_CYRILLIC_MAP = str.maketrans({
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "yo",
+    "ж": "zh", "з": "z", "и": "i", "й": "y", "к": "k", "л": "l", "м": "m",
+    "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+    "ф": "f", "х": "h", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "shch",
+    "ъ": "ʺ", "ы": "y", "ь": "ʹ", "э": "e", "ю": "yu", "я": "ya",
+    "А": "A", "Б": "B", "В": "V", "Г": "G", "Д": "D", "Е": "E", "Ё": "Yo",
+    "Ж": "Zh", "З": "Z", "И": "I", "Й": "Y", "К": "K", "Л": "L", "М": "M",
+    "Н": "N", "О": "O", "П": "P", "Р": "R", "С": "S", "Т": "T", "У": "U",
+    "Ф": "F", "Х": "H", "Ц": "Ts", "Ч": "Ch", "Ш": "Sh", "Щ": "Shch",
+    "Ъ": "ʺ", "Ы": "Y", "Ь": "ʹ", "Э": "E", "Ю": "Yu", "Я": "Ya",
+})
 
 COMMAND_RE = re.compile(r"^\.(mute|unmute|typing|type|del|spam|hack|flip|tiny)(?:\s+([\s\S]*))?$", re.IGNORECASE)
 DURATION_RE = re.compile(r"^(\d+)(s|sec|сек|m|min|мин|h|час|d|д)?$", re.IGNORECASE)
@@ -92,8 +104,10 @@ class SecretaryService:
 
     async def _remember_chat(self, connection_id: str, chat: dict[str, Any], message_date: int | None = None):
         chat_id = chat.get("id")
-        if not connection_id or not chat_id:
+        chat_type = str(chat.get("type") or "")
+        if not chat_id or (not connection_id and chat_type not in {"group", "supergroup"}):
             return
+        connection_id = str(connection_id or "")
         now = time.time()
         key = (connection_id, int(chat_id))
         if now - self.chat_write_times.get(key, 0) < 60:
@@ -110,7 +124,7 @@ class SecretaryService:
                      chat_type=excluded.chat_type, title=excluded.title, username=excluded.username,
                      first_name=excluded.first_name, last_name=excluded.last_name,
                      last_seen_at=MAX(secretary_chats.last_seen_at, excluded.last_seen_at)""",
-                (connection_id, int(chat_id), str(chat.get("type") or "private"), chat.get("title"),
+                (connection_id, int(chat_id), chat_type or "private", chat.get("title"),
                  chat.get("username"), chat.get("first_name"), chat.get("last_name"), seen_at),
             )
 
@@ -211,7 +225,8 @@ class SecretaryService:
         def load(conn):
             rows = conn.execute(
                 "SELECT business_connection_id, chat_id, chat_type, title, username, first_name, last_name "
-                "FROM secretary_chats WHERE chat_type='private' ORDER BY last_seen_at DESC LIMIT 20"
+                "FROM secretary_chats WHERE chat_type IN ('private','group','supergroup') "
+                "ORDER BY last_seen_at DESC LIMIT 20"
             ).fetchall()
             return [_row_to_dict(row) for row in rows]
         return await self._db(load)
@@ -361,6 +376,62 @@ class SecretaryService:
         if text.startswith("."):
             await self._execute(text, connection_id, chat_id, source=message)
 
+    async def _handle_group_message(self, message: dict[str, Any]):
+        chat = message.get("chat") or {}
+        chat_type = str(chat.get("type") or "")
+        if chat_type not in {"group", "supergroup"}:
+            return
+        sender = message.get("from") or {}
+        if sender.get("is_bot"):
+            return
+        chat_id = int(chat.get("id") or 0)
+        sender_id = int(sender.get("id") or 0)
+        if not chat_id:
+            return
+
+        mute_key = ("", chat_id)
+        mute_expiry = self.active_mutes.get(mute_key)
+        if sender_id and sender_id != self.owner_id and mute_expiry:
+            if mute_expiry > time.time():
+                try:
+                    await self._api("deleteMessage", {
+                        "chat_id": chat_id, "message_id": int(message["message_id"]),
+                    })
+                except TelegramApiError as error:
+                    logger.warning("Secretary group mute delete failed chat_id=%s: %s", chat_id, error)
+                return
+            self.active_mutes.pop(mute_key, None)
+
+        asyncio.create_task(self._remember_chat_safely("", chat, message.get("date")))
+        if sender_id != self.owner_id:
+            return
+        text = str(message.get("text") or "").strip()
+        if text.startswith("."):
+            await self._execute(text, "", chat_id, source=message)
+
+    @staticmethod
+    def _with_business(connection_id: str, params: dict[str, Any]) -> dict[str, Any]:
+        return {"business_connection_id": connection_id, **params} if connection_id else params
+
+    async def _delete_message(self, connection_id: str, chat_id: int, message_id: int):
+        if connection_id:
+            await self._api("deleteBusinessMessages", {
+                "business_connection_id": connection_id, "message_ids": [int(message_id)],
+            })
+        else:
+            await self._api("deleteMessage", {"chat_id": int(chat_id), "message_id": int(message_id)})
+
+    async def _send_message(self, connection_id: str, chat_id: int, text: str) -> int:
+        sent = await self._api("sendMessage", self._with_business(connection_id, {
+            "chat_id": int(chat_id), "text": text,
+        }))
+        return int(sent["message_id"])
+
+    async def _edit_message(self, connection_id: str, chat_id: int, message_id: int, text: str):
+        await self._api("editMessageText", self._with_business(connection_id, {
+            "chat_id": int(chat_id), "message_id": int(message_id), "text": text,
+        }))
+
     async def _handle_update(self, update: dict[str, Any]):
         if update.get("business_connection"):
             connection = update["business_connection"]
@@ -382,7 +453,11 @@ class SecretaryService:
         if update.get("business_message"):
             await self._handle_business_message(update["business_message"])
         elif update.get("message"):
-            await self._handle_dm(update["message"])
+            message = update["message"]
+            if (message.get("chat") or {}).get("type") in {"group", "supergroup"}:
+                await self._handle_group_message(message)
+            else:
+                await self._handle_dm(message)
         elif update.get("callback_query"):
             await self._callback(update)
 
@@ -401,19 +476,15 @@ class SecretaryService:
         if source:
             message_id = int(source["message_id"])
             if delete_source:
-                await self._api("deleteBusinessMessages", {
-                    "business_connection_id": connection_id, "message_ids": [message_id],
-                })
+                await self._delete_message(connection_id, chat_id, message_id)
                 return None
-            await self._api("editMessageText", {
-                "business_connection_id": connection_id, "chat_id": chat_id,
-                "message_id": message_id, "text": text,
-            })
-            return message_id
-        sent = await self._api("sendMessage", {
-            "business_connection_id": connection_id, "chat_id": chat_id, "text": text,
-        })
-        return int(sent["message_id"])
+            if connection_id:
+                await self._edit_message(connection_id, chat_id, message_id, text)
+                return message_id
+            # Group messages belong to their sender: delete the command and
+            # send the replacement from the secretary bot itself.
+            await self._delete_message("", chat_id, message_id)
+        return await self._send_message(connection_id, chat_id, text)
 
     async def _execute(self, command_text: str, connection_id: str, chat_id: int, *, source: dict[str, Any] | None):
         match = COMMAND_RE.match(command_text.strip())
@@ -455,9 +526,9 @@ class SecretaryService:
                     return
                 expires = now + duration
                 await self._edit_or_send(connection_id, chat_id, source, "ща чо расскажу вам")
-                await self._api("sendChatAction", {
-                    "business_connection_id": connection_id, "chat_id": chat_id, "action": "typing",
-                })
+                await self._api("sendChatAction", self._with_business(connection_id, {
+                    "chat_id": chat_id, "action": "typing",
+                }))
                 await self._create_job("typing", connection_id, chat_id, next_at=now + 4, expires_at=expires)
                 return
 
@@ -517,7 +588,8 @@ class SecretaryService:
                 return
 
             if command == "tiny":
-                await self._edit_or_send(connection_id, chat_id, source, args.translate(TINY_MAP)[:4096])
+                tiny_text = args.translate(TINY_CYRILLIC_MAP).translate(TINY_MAP)
+                await self._edit_or_send(connection_id, chat_id, source, tiny_text[:4096])
                 return
         except TelegramApiError as error:
             logger.warning("Secretary action failed command=%s chat_id=%s code=%s: %s", command, chat_id, error.code, error)
@@ -549,17 +621,15 @@ class SecretaryService:
                 if expires <= time.time():
                     await self._finish_job(job_id)
                     return
-                await self._api("sendChatAction", {
-                    "business_connection_id": connection_id, "chat_id": chat_id, "action": "typing",
-                })
+                await self._api("sendChatAction", self._with_business(connection_id, {
+                    "chat_id": chat_id, "action": "typing",
+                }))
                 await self._update_job(job_id, next_at=min(time.time() + 4, expires))
                 return
 
             if kind == "delete":
                 if float(job.get("expires_at") or 0) <= time.time():
-                    await self._api("deleteBusinessMessages", {
-                        "business_connection_id": connection_id, "message_ids": [message_id],
-                    })
+                    await self._delete_message(connection_id, chat_id, message_id)
                     await self._finish_job(job_id)
                 return
 
@@ -569,10 +639,7 @@ class SecretaryService:
                 if remaining <= 0:
                     await self._finish_job(job_id)
                     return
-                await self._api("sendMessage", {
-                    "business_connection_id": connection_id, "chat_id": chat_id,
-                    "text": str(payload.get("text") or "")[:4096],
-                })
+                await self._send_message(connection_id, chat_id, str(payload.get("text") or "")[:4096])
                 remaining -= 1
                 if remaining <= 0:
                     await self._finish_job(job_id)
@@ -586,10 +653,7 @@ class SecretaryService:
                 cursor = int(payload.get("cursor") or 0)
                 step = max(1, int(payload.get("step") or 1))
                 cursor = min(len(text), cursor + step)
-                await self._api("editMessageText", {
-                    "business_connection_id": connection_id, "chat_id": chat_id,
-                    "message_id": message_id, "text": text[:cursor],
-                })
+                await self._edit_message(connection_id, chat_id, message_id, text[:cursor])
                 if cursor >= len(text):
                     await self._finish_job(job_id)
                 else:
@@ -601,16 +665,11 @@ class SecretaryService:
                 stages = payload.get("stages") or []
                 index = int(payload.get("index") or 0)
                 if index >= len(stages):
-                    await self._api("editMessageText", {
-                        "business_connection_id": connection_id, "chat_id": chat_id,
-                        "message_id": message_id, "text": "Взлом завершён: доступ к мемам получен 😎",
-                    })
+                    await self._edit_message(connection_id, chat_id, message_id,
+                                             "Взлом завершён: доступ к мемам получен 😎")
                     await self._finish_job(job_id)
                 else:
-                    await self._api("editMessageText", {
-                        "business_connection_id": connection_id, "chat_id": chat_id,
-                        "message_id": message_id, "text": str(stages[index]),
-                    })
+                    await self._edit_message(connection_id, chat_id, message_id, str(stages[index]))
                     payload["index"] = index + 1
                     await self._update_job(job_id, payload=payload, next_at=time.time() + 0.45)
         except TelegramApiError as error:
