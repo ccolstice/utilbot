@@ -20,6 +20,9 @@ FLIP_MAP = str.maketrans({
     **dict(zip("abcdefghijklmnopqrstuvwxyz", "ɐqɔpǝɟƃɥᴉɾʞןɯuodbɹsʇnʌʍxʎz")),
     **dict(zip("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "∀𐐒ƆᗡƎℲפHIſꓘ˥WNOԀΌᴚS⊥∩ΛMX⅄Z")),
     **dict(zip("0123456789", "0ƖᄅƐㄣϛ9ㄥ86")),
+    # Cyrillic has no reliable upside-down equivalents. Keep its alphabet
+    # intact; only reverse the text order instead of transliterating to Latin.
+    **{chr(codepoint): chr(codepoint) for codepoint in range(0x0400, 0x0530)},
     **{"!": "¡", "?": "¿", ".": "˙", ",": "'", "'": ",", "(": ")", ")": "(",
        "[": "]", "]": "[", "{": "}", "}": "{", "<": ">", ">": "<", "_": "‾", "&": "⅋", ";": "؛"},
 })
@@ -288,15 +291,283 @@ class SecretaryService:
             "`.type текст` — показать текст поэтапно\n"
             "`.del 100 текст` — отправить текст и удалить его через 100 секунд\n"
             "`.spam 5 текст` — отправить текст 5 раз\n"
-            "`.hack`, `.flip текст`, `.tiny текст`\n\n/chats — выбрать чат заново"})
+            "`.hack`, `.flip текст`, `.tiny текст`\n\n"
+            "/deleted — архив удалённых сообщений\n"
+            "/edited — архив изменений\n"
+            "/chats — выбрать чат заново"})
+
+    async def _send_dm_menu(self, chat_id: int, message_id: int | None = None):
+        params = {
+            "chat_id": chat_id,
+            "text": "Секретарь. Здесь можно открыть архив изменений или выбрать чат для команд.",
+            "reply_markup": {"inline_keyboard": [
+                [{"text": "🗑 Удалённые сообщения", "callback_data": "hist:deleted:0"}],
+                [{"text": "✏️ Изменённые сообщения", "callback_data": "hist:edited:0"}],
+                [{"text": "💬 Выбрать чат", "callback_data": "hist:chats"}],
+            ]},
+        }
+        if message_id:
+            params["message_id"] = message_id
+            await self._api("editMessageText", params)
+        else:
+            await self._api("sendMessage", params)
+
+    @staticmethod
+    def _sender_name(sender: dict[str, Any]) -> str:
+        name = " ".join(filter(None, [sender.get("first_name"), sender.get("last_name")]))
+        if sender.get("username"):
+            name += f" (@{sender['username']})"
+        return name or ("Бот" if sender.get("is_bot") else "Участник чата")
+
+    @staticmethod
+    def _message_content(message: dict[str, Any] | None) -> str:
+        if not message:
+            return "[предыдущая версия недоступна]"
+        text = str(message.get("text") or message.get("caption") or "").strip()
+        media_names = {
+            "photo": "фото", "video": "видео", "animation": "анимация", "voice": "голосовое",
+            "audio": "аудио", "video_note": "видеосообщение", "document": "файл",
+            "sticker": "стикер", "location": "геопозиция", "venue": "место",
+            "contact": "контакт", "poll": "опрос", "dice": "кубик",
+        }
+        labels = [f"[{label}]" for field, label in media_names.items() if message.get(field)]
+        if text and labels:
+            return f"{text}\n{' '.join(labels)}"
+        return text or " ".join(labels) or "[сообщение без текста]"
+
+    @staticmethod
+    def _message_media(message: dict[str, Any] | None) -> tuple[str, str, str] | None:
+        if not message:
+            return None
+        for field, method, parameter in (
+            ("photo", "sendPhoto", "photo"), ("video", "sendVideo", "video"),
+            ("animation", "sendAnimation", "animation"), ("voice", "sendVoice", "voice"),
+            ("audio", "sendAudio", "audio"), ("video_note", "sendVideoNote", "video_note"),
+            ("document", "sendDocument", "document"), ("sticker", "sendSticker", "sticker"),
+        ):
+            value = message.get(field)
+            if isinstance(value, list) and value:
+                value = value[-1]
+            if isinstance(value, dict) and value.get("file_id"):
+                return method, parameter, str(value["file_id"])
+        return None
+
+    async def _save_message_snapshot(self, message: dict[str, Any], *, ignore_delete: bool = False):
+        connection_id = str(message.get("business_connection_id") or "")
+        chat = message.get("chat") or {}
+        sender = message.get("from") or {}
+        chat_id = int(chat.get("id") or 0)
+        message_id = int(message.get("message_id") or 0)
+        if (not connection_id or chat.get("type") != "private" or not chat_id or not message_id
+                or not int(sender.get("id") or 0)):
+            return
+        encoded = json.dumps(message, ensure_ascii=False, separators=(",", ":"))
+        await self._db(lambda conn: conn.execute(
+            "INSERT INTO secretary_message_snapshots "
+            "(business_connection_id, chat_id, message_id, sender_id, sender_name, message_json, ignore_delete, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(business_connection_id, chat_id, message_id) DO UPDATE SET "
+            "sender_id=excluded.sender_id, sender_name=excluded.sender_name, message_json=excluded.message_json, "
+            "ignore_delete=excluded.ignore_delete, updated_at=excluded.updated_at",
+            (connection_id, chat_id, message_id, int(sender.get("id") or 0), self._sender_name(sender),
+             encoded, int(ignore_delete), time.time()),
+        ))
+
+    async def _save_edited_message(self, update_id: int, message: dict[str, Any]):
+        connection_id = str(message.get("business_connection_id") or "")
+        chat = message.get("chat") or {}
+        sender = message.get("from") or {}
+        chat_id = int(chat.get("id") or 0)
+        message_id = int(message.get("message_id") or 0)
+        if not connection_id or chat.get("type") != "private" or not chat_id or not message_id:
+            return
+        sender_id = int(sender.get("id") or 0)
+        if not sender_id or sender.get("is_bot"):
+            return
+        sender_name = self._sender_name(sender)
+        current_json = json.dumps(message, ensure_ascii=False, separators=(",", ":"))
+        chat_title = self._chat_label({**chat, "chat_id": chat_id})
+        event_key = f"edit:{update_id}"
+
+        def save(conn):
+            previous = conn.execute(
+                "SELECT * FROM secretary_message_snapshots WHERE business_connection_id=? AND chat_id=? AND message_id=?",
+                (connection_id, chat_id, message_id),
+            ).fetchone()
+            previous_json = previous["message_json"] if previous else None
+            old_sender_id = int(previous["sender_id"] or 0) if previous else sender_id
+            added = False
+            if old_sender_id != self.owner_id and sender_id != self.owner_id:
+                cursor = conn.execute(
+                    "INSERT OR IGNORE INTO secretary_message_events "
+                    "(event_key, event_type, business_connection_id, chat_id, message_id, sender_id, sender_name, chat_title, old_message_json, new_message_json, created_at) "
+                    "VALUES (?, 'edited', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (event_key, connection_id, chat_id, message_id, sender_id, sender_name, chat_title,
+                     previous_json, current_json, time.time()),
+                )
+                added = cursor.rowcount > 0
+            conn.execute(
+                "INSERT INTO secretary_message_snapshots "
+                "(business_connection_id, chat_id, message_id, sender_id, sender_name, message_json, ignore_delete, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, 0, ?) ON CONFLICT(business_connection_id, chat_id, message_id) DO UPDATE SET "
+                "sender_id=excluded.sender_id, sender_name=excluded.sender_name, message_json=excluded.message_json, "
+                "ignore_delete=0, updated_at=excluded.updated_at",
+                (connection_id, chat_id, message_id, sender_id, sender_name, current_json, time.time()),
+            )
+            if not added:
+                return None
+            row = conn.execute("SELECT * FROM secretary_message_events WHERE event_key=?", (event_key,)).fetchone()
+            return _row_to_dict(row)
+
+        event = await self._db(save)
+        if event:
+            await self._send_history_event(event)
+
+    async def _consume_deleted_message(self, connection_id: str, chat: dict[str, Any], message_id: int):
+        chat_id = int(chat.get("id") or 0)
+        event_key = f"delete:{connection_id}:{chat_id}:{message_id}"
+        chat_title = self._chat_label({**chat, "chat_id": chat_id})
+
+        def consume(conn):
+            snapshot = conn.execute(
+                "SELECT * FROM secretary_message_snapshots WHERE business_connection_id=? AND chat_id=? AND message_id=?",
+                (connection_id, chat_id, message_id),
+            ).fetchone()
+            if snapshot is None:
+                return None
+            conn.execute(
+                "DELETE FROM secretary_message_snapshots WHERE business_connection_id=? AND chat_id=? AND message_id=?",
+                (connection_id, chat_id, message_id),
+            )
+            if bool(snapshot["ignore_delete"]) or int(snapshot["sender_id"] or 0) == self.owner_id:
+                return None
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO secretary_message_events "
+                "(event_key, event_type, business_connection_id, chat_id, message_id, sender_id, sender_name, chat_title, old_message_json, new_message_json, created_at) "
+                "VALUES (?, 'deleted', ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
+                (event_key, connection_id, chat_id, message_id, snapshot["sender_id"], snapshot["sender_name"],
+                 chat_title, snapshot["message_json"], time.time()),
+            )
+            if cursor.rowcount <= 0:
+                return None
+            return _row_to_dict(conn.execute(
+                "SELECT * FROM secretary_message_events WHERE event_key=?", (event_key,)
+            ).fetchone())
+
+        return await self._db(consume)
+
+    async def _send_history_event(self, event: dict[str, Any]):
+        old_message = json.loads(event.get("old_message_json") or "{}") or None
+        new_message = json.loads(event.get("new_message_json") or "{}") or None
+        content = self._message_content(old_message)
+        if event["event_type"] == "deleted":
+            text = (f"🗑 Удалено в «{event['chat_title']}»\nАвтор: {event['sender_name']}\n\n{content}")
+        else:
+            updated = self._message_content(new_message)
+            text = (f"✏️ Изменено в «{event['chat_title']}»\nАвтор: {event['sender_name']}\n\n"
+                    f"Было:\n{content}\n\nСтало:\n{updated}")
+        await self._api("sendMessage", {"chat_id": self.owner_id, "text": text[:4000]})
+        media = self._message_media(old_message if event["event_type"] == "deleted" else new_message)
+        if media:
+            method, field, file_id = media
+            try:
+                await self._api(method, {"chat_id": self.owner_id, field: file_id})
+            except TelegramApiError as error:
+                logger.warning("Secretary could not copy archived media event_id=%s: %s", event["id"], error)
+
+    async def _show_history(self, chat_id: int, event_type: str, page: int = 0, message_id: int | None = None):
+        page_size = 8
+        total = await self._db(lambda conn: conn.execute(
+            "SELECT COUNT(*) AS count FROM secretary_message_events WHERE event_type=?", (event_type,)
+        ).fetchone()["count"])
+        rows = await self._db(lambda conn: [
+            _row_to_dict(row) for row in conn.execute(
+                "SELECT id, sender_name, chat_title, old_message_json, new_message_json, created_at "
+                "FROM secretary_message_events WHERE event_type=? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                (event_type, page_size, page * page_size),
+            ).fetchall()
+        ])
+        label = "Удалённые сообщения" if event_type == "deleted" else "Изменённые сообщения"
+        buttons = []
+        for row in rows:
+            raw_message = row.get("old_message_json") if event_type == "deleted" else row.get("new_message_json")
+            snippet = self._message_content(json.loads(raw_message or "{}"))[:34]
+            title = f"{row['chat_title']} · {snippet}"[:60]
+            buttons.append([{"text": title, "callback_data": f"hist:item:{event_type}:{row['id']}:{page}"}])
+        navigation = []
+        if page > 0:
+            navigation.append({"text": "⬅️", "callback_data": f"hist:{event_type}:{page - 1}"})
+        if (page + 1) * page_size < total:
+            navigation.append({"text": "➡️", "callback_data": f"hist:{event_type}:{page + 1}"})
+        if navigation:
+            buttons.append(navigation)
+        buttons.append([{"text": "🏠 Меню", "callback_data": "hist:menu"}])
+        body = f"{label} · {total}\nВыбери запись:" if total else f"{label}\nПока записей нет."
+        params = {"chat_id": chat_id, "text": body, "reply_markup": {"inline_keyboard": buttons}}
+        if message_id:
+            params["message_id"] = message_id
+            try:
+                await self._api("editMessageText", params)
+                return
+            except TelegramApiError as error:
+                if error.code != 400 or "message is not modified" not in str(error).lower():
+                    raise
+                return
+        await self._api("sendMessage", params)
+
+    async def _show_history_item(self, chat_id: int, event_type: str, event_id: int, page: int, message_id: int):
+        row = await self._db(lambda conn: _row_to_dict(conn.execute(
+            "SELECT * FROM secretary_message_events WHERE id=? AND event_type=?", (event_id, event_type)
+        ).fetchone()))
+        if not row:
+            await self._api("editMessageText", {
+                "chat_id": chat_id, "message_id": message_id, "text": "Запись не найдена.",
+                "reply_markup": {"inline_keyboard": [[{"text": "🏠 Меню", "callback_data": "hist:menu"}]]},
+            })
+            return
+        old_message = json.loads(row.get("old_message_json") or "{}") or None
+        new_message = json.loads(row.get("new_message_json") or "{}") or None
+        old_text = self._message_content(old_message)
+        if event_type == "deleted":
+            body = f"🗑 Удалено в «{row['chat_title']}»\nАвтор: {row['sender_name']}\n\n{old_text}"
+        else:
+            body = (f"✏️ Изменено в «{row['chat_title']}»\nАвтор: {row['sender_name']}\n\n"
+                    f"Было:\n{old_text}\n\nСтало:\n{self._message_content(new_message)}")
+        await self._api("editMessageText", {
+            "chat_id": chat_id, "message_id": message_id, "text": body[:4000],
+            "reply_markup": {"inline_keyboard": [[
+                {"text": "⬅️ К списку", "callback_data": f"hist:{event_type}:{page}"},
+                {"text": "🏠 Меню", "callback_data": "hist:menu"},
+            ]]},
+        })
+        media = self._message_media(old_message if event_type == "deleted" else new_message)
+        if media:
+            method, field, file_id = media
+            await self._api(method, {"chat_id": chat_id, field: file_id})
 
     async def _callback(self, update: dict[str, Any]):
         query = update.get("callback_query") or {}
         sender = query.get("from") or {}
         message = query.get("message") or {}
         callback_data = str(query.get("data") or "")
-        if int(sender.get("id") or 0) != self.owner_id or not callback_data.startswith("sec:"):
+        if int(sender.get("id") or 0) != self.owner_id:
             await self._api("answerCallbackQuery", {"callback_query_id": query.get("id"), "text": "Нет доступа", "show_alert": True})
+            return
+        if callback_data.startswith("hist:"):
+            parts = callback_data.split(":")
+            await self._api("answerCallbackQuery", {"callback_query_id": query.get("id")})
+            chat_id = int((message.get("chat") or {}).get("id") or self.owner_id)
+            message_id = int(message.get("message_id") or 0)
+            if parts[1] == "menu":
+                await self._send_dm_menu(chat_id, message_id or None)
+            elif parts[1] == "chats":
+                await self._show_chats(chat_id)
+            elif parts[1] == "item" and len(parts) == 5 and message_id:
+                await self._show_history_item(chat_id, parts[2], int(parts[3]), int(parts[4]), message_id)
+            elif parts[1] in {"deleted", "edited"} and len(parts) == 3:
+                await self._show_history(chat_id, parts[1], max(0, int(parts[2])), message_id or None)
+            return
+        if not callback_data.startswith("sec:"):
+            await self._api("answerCallbackQuery", {"callback_query_id": query.get("id"), "text": "Некорректная кнопка"})
             return
         try:
             target_id = int(callback_data.split(":", 1)[1])
@@ -329,8 +600,17 @@ class SecretaryService:
         if not chat_id or not text:
             return
         command = text.split(maxsplit=1)[0].split("@", 1)[0].lower()
-        if command in {"/start", "/chats"}:
+        if command == "/start":
+            await self._send_dm_menu(chat_id)
+            return
+        if command in {"/chats", "💬 выбрать чат"}:
             await self._show_chats(chat_id)
+            return
+        if command in {"/deleted", "🗑 удалённые сообщения"}:
+            await self._show_history(chat_id, "deleted")
+            return
+        if command in {"/edited", "✏️ изменённые сообщения"}:
+            await self._show_history(chat_id, "edited")
             return
         if command in {"/help"}:
             await self._send_dm_help(chat_id)
@@ -360,10 +640,16 @@ class SecretaryService:
         if sender.get("is_bot"):
             return
 
-        # Deletion is handled from the in-memory timer map so no Turso round-trip
-        # sits in front of the fastest path.
+        # Keep the latest message body so Telegram's deletion update (which
+        # contains only message IDs) can be resolved to its original content.
+        # Messages removed by .mute are marked so they do not trigger a reply.
         mute_key = (connection_id, chat_id)
         mute_expiry = self.active_mutes.get(mute_key)
+        muted_contact_message = sender_id != self.owner_id and bool(mute_expiry and mute_expiry > time.time())
+        await self._save_message_snapshot(message, ignore_delete=muted_contact_message)
+
+        # Deletion is handled from the in-memory timer map so no Turso round-trip
+        # sits in front of the fastest path.
         if sender_id != self.owner_id and mute_expiry:
             if mute_expiry > time.time():
                 try:
@@ -458,6 +744,33 @@ class SecretaryService:
             return
         if update.get("business_message"):
             await self._handle_business_message(update["business_message"])
+        elif update.get("edited_business_message"):
+            await self._save_edited_message(int(update.get("update_id") or 0), update["edited_business_message"])
+        elif update.get("deleted_business_messages"):
+            deleted = update["deleted_business_messages"]
+            connection_id = str(deleted.get("business_connection_id") or "")
+            chat = deleted.get("chat") or {}
+            chat_id = int(chat.get("id") or 0)
+            public_lines = []
+            for message_id in deleted.get("message_ids") or []:
+                event = await self._consume_deleted_message(connection_id, chat, int(message_id))
+                if not event:
+                    continue
+                try:
+                    await self._send_history_event(event)
+                except Exception:
+                    logger.exception("Secretary could not notify owner about deleted message id=%s", message_id)
+                old_message = json.loads(event.get("old_message_json") or "{}") or None
+                removed_text = self._message_content(old_message).replace("\n", " ")
+                public_lines.append(f"Зачем ты удалил сообщение «{removed_text[:220]}»?")
+            if connection_id and chat_id and public_lines:
+                notice = "\n".join(public_lines[:5])
+                if len(public_lines) > 5:
+                    notice += f"\n…и ещё {len(public_lines) - 5} удалённых сообщений."
+                try:
+                    await self._send_message(connection_id, chat_id, notice[:4000])
+                except Exception:
+                    logger.exception("Secretary could not post deletion notice in chat_id=%s", chat_id)
         elif update.get("message"):
             message = update["message"]
             if (message.get("chat") or {}).get("type") in {"group", "supergroup"}:
@@ -763,6 +1076,8 @@ class SecretaryService:
             ("setMyCommands", {"commands": [
                 {"command": "start", "description": "Открыть секретаря"},
                 {"command": "chats", "description": "Выбрать чат"},
+                {"command": "deleted", "description": "Удалённые сообщения"},
+                {"command": "edited", "description": "Изменённые сообщения"},
                 {"command": "help", "description": "Помощь"},
                 {"command": "cancel", "description": "Сбросить выбранный чат"},
             ]}),
@@ -779,6 +1094,7 @@ class SecretaryService:
             try:
                 params: dict[str, Any] = {"timeout": 25, "allowed_updates": [
                     "message", "callback_query", "business_connection", "business_message", "edited_business_message",
+                    "deleted_business_messages",
                 ]}
                 if offset is not None:
                     params["offset"] = offset

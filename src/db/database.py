@@ -290,6 +290,33 @@ def init_db():
         value TEXT
     );
 
+    CREATE TABLE IF NOT EXISTS secretary_message_snapshots (
+        business_connection_id TEXT NOT NULL,
+        chat_id INTEGER NOT NULL,
+        message_id INTEGER NOT NULL,
+        sender_id INTEGER,
+        sender_name TEXT,
+        message_json TEXT NOT NULL,
+        ignore_delete INTEGER NOT NULL DEFAULT 0,
+        updated_at REAL NOT NULL,
+        PRIMARY KEY (business_connection_id, chat_id, message_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS secretary_message_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_key TEXT NOT NULL UNIQUE,
+        event_type TEXT NOT NULL,
+        business_connection_id TEXT NOT NULL,
+        chat_id INTEGER NOT NULL,
+        message_id INTEGER NOT NULL,
+        sender_id INTEGER,
+        sender_name TEXT,
+        chat_title TEXT,
+        old_message_json TEXT,
+        new_message_json TEXT,
+        created_at REAL NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS rss_feeds (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER NOT NULL,
@@ -447,6 +474,9 @@ def init_db():
 
     CREATE INDEX IF NOT EXISTS idx_secretary_jobs_due
         ON secretary_jobs(status, next_at);
+
+    CREATE INDEX IF NOT EXISTS idx_secretary_message_events_recent
+        ON secretary_message_events(event_type, created_at DESC);
     """)
 
     conn.commit()
