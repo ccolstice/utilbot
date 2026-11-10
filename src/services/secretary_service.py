@@ -79,7 +79,11 @@ def _db(callable_):
             return result
         except Exception as error:
             message = str(error).lower()
-            retryable = "sqlite_busy" in message or "database is locked" in message
+            retryable = (
+                "sqlite_busy" in message
+                or "database is locked" in message
+                or "stream not found" in message
+            )
             if not retryable or attempt >= len(delays):
                 raise
             with suppress(Exception):
@@ -596,12 +600,15 @@ class SecretaryService:
         except ValueError:
             await self._api("answerCallbackQuery", {"callback_query_id": query.get("id"), "text": "Некорректный чат"})
             return
+        # Telegram expires callback queries quickly; acknowledge before any
+        # remote Turso reads/writes so database latency cannot invalidate it.
+        await self._api("answerCallbackQuery", {"callback_query_id": query.get("id"), "text": "Открываю чат…"})
         target = await self._get_chat(target_id)
         if not target:
-            await self._api("answerCallbackQuery", {"callback_query_id": query.get("id"), "text": "Чат уже недоступен. Нажми /chats"})
+            if message.get("chat"):
+                await self._api("sendMessage", {"chat_id": message["chat"]["id"], "text": "Чат уже недоступен. Нажми /chats"})
             return
         await self._set_session(self.owner_id, target["business_connection_id"], target_id)
-        await self._api("answerCallbackQuery", {"callback_query_id": query.get("id"), "text": "Чат выбран"})
         with suppress(Exception):
             if message.get("chat") and message.get("message_id"):
                 await self._api("editMessageText", {
