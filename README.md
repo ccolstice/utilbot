@@ -100,4 +100,6 @@ The optional secretary bot runs beside UtilBot in this same Render service. In R
 
 After deployment, start a private chat with the new bot and press Start. In Telegram's Business settings, connect this bot and select the chats it may manage; grant message reply/edit and delete permissions if Telegram offers them. A chat appears in `/chats` after the secretary has received a message from it. In a connected private chat, send `.mute`, `.typing 30min`, `.type текст`, `.del 100 текст`, `.spam 5 текст`, `.hack`, `.flip текст`, or `.tiny текст` directly. The command message is edited or deleted as the first Telegram action; Telegram may still display it briefly while that request is in flight. In the secretary bot's private chat, use `/chats` to choose a target and then send the same dot command as a fallback.
 
+`.tiny` renders Latin text with small-cap characters and transliterates Russian Cyrillic to Latin small caps so Russian input changes visibly too.
+
 This feature does not connect to the SIWC/ChatGPT bot. It uses a separate BotFather token and a separate Telegram polling loop inside the existing UtilBot process.
