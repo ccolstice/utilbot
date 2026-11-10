@@ -253,6 +253,43 @@ def init_db():
         value TEXT
     );
 
+    CREATE TABLE IF NOT EXISTS secretary_chats (
+        business_connection_id TEXT NOT NULL,
+        chat_id INTEGER NOT NULL,
+        chat_type TEXT NOT NULL DEFAULT 'private',
+        title TEXT,
+        username TEXT,
+        first_name TEXT,
+        last_name TEXT,
+        last_seen_at REAL NOT NULL,
+        PRIMARY KEY (business_connection_id, chat_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS secretary_sessions (
+        owner_id INTEGER PRIMARY KEY,
+        business_connection_id TEXT NOT NULL,
+        chat_id INTEGER NOT NULL,
+        updated_at REAL NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS secretary_jobs (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        business_connection_id TEXT NOT NULL,
+        chat_id INTEGER NOT NULL,
+        message_id INTEGER,
+        payload TEXT NOT NULL DEFAULT '{}',
+        next_at REAL NOT NULL,
+        expires_at REAL,
+        status TEXT NOT NULL DEFAULT 'active',
+        created_at REAL NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS secretary_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    );
+
     CREATE TABLE IF NOT EXISTS rss_feeds (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER NOT NULL,
@@ -404,6 +441,12 @@ def init_db():
 
     CREATE INDEX IF NOT EXISTS idx_collection_items_item
         ON collection_items(item_id);
+
+    CREATE INDEX IF NOT EXISTS idx_secretary_chats_recent
+        ON secretary_chats(last_seen_at DESC);
+
+    CREATE INDEX IF NOT EXISTS idx_secretary_jobs_due
+        ON secretary_jobs(status, next_at);
     """)
 
     conn.commit()

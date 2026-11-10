@@ -1,0 +1,742 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import math
+import re
+import time
+import uuid
+from contextlib import suppress
+from typing import Any
+
+import aiohttp
+
+from src.config import Settings
+from src.db.database import get_connection
+
+logger = logging.getLogger(__name__)
+
+FLIP_MAP = str.maketrans({
+    **dict(zip("abcdefghijklmnopqrstuvwxyz", "ɐqɔpǝɟƃɥᴉɾʞןɯuodbɹsʇnʌʍxʎz")),
+    **dict(zip("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "∀𐐒ƆᗡƎℲפHIſꓘ˥WNOԀΌᴚS⊥∩ΛMX⅄Z")),
+    **dict(zip("0123456789", "0ƖᄅƐㄣϛ9ㄥ86")),
+    **{"!": "¡", "?": "¿", ".": "˙", ",": "'", "'": ",", "(": ")", ")": "(",
+       "[": "]", "]": "[", "{": "}", "}": "{", "<": ">", ">": "<", "_": "‾", "&": "⅋", ";": "؛"},
+})
+TINY_MAP = str.maketrans({
+    **dict(zip("abcdefghijklmnopqrstuvwxyz", "ᴀʙᴄᴅᴇꜰɢʜɪᴊᴋʟᴍɴᴏᴘǫʀꜱᴛᴜᴠᴡxʏᴢ")),
+    **dict(zip("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "ABCDEFGHIJKLMNOPQRSTUVWXYZ")),
+})
+
+COMMAND_RE = re.compile(r"^\.(mute|unmute|typing|type|del|spam|hack|flip|tiny)(?:\s+([\s\S]*))?$", re.IGNORECASE)
+DURATION_RE = re.compile(r"^(\d+)(s|sec|сек|m|min|мин|h|час|d|д)?$", re.IGNORECASE)
+
+
+class TelegramApiError(RuntimeError):
+    def __init__(self, method: str, payload: dict[str, Any]):
+        self.method = method
+        self.code = payload.get("error_code")
+        self.retry_after = (payload.get("parameters") or {}).get("retry_after")
+        super().__init__(str(payload.get("description") or f"Telegram API {method} failed"))
+
+
+def _db(callable_):
+    conn = get_connection()
+    try:
+        result = callable_(conn)
+        conn.commit()
+        return result
+    finally:
+        conn.close()
+
+
+def _row_to_dict(row) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    return {key: row[key] for key in row.keys()}
+
+
+class SecretaryService:
+    """Small raw Bot API poller for the second, Business-enabled bot token."""
+
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.token = settings.secretary_bot_token
+        self.owner_id = settings.secretary_owner_user_id
+        self.base_url = f"https://api.telegram.org/bot{self.token}"
+        self.session: aiohttp.ClientSession | None = None
+        self.active_mutes: dict[tuple[str, int], float] = {}
+        self.scheduler_task: asyncio.Task | None = None
+        self.scheduler_wakeup = asyncio.Event()
+        self.chat_write_times: dict[tuple[str, int], float] = {}
+
+    async def _api(self, method: str, data: dict[str, Any] | None = None, *, timeout: int = 40):
+        if self.session is None:
+            raise RuntimeError("Secretary Bot API session is not ready")
+        async with self.session.post(
+            f"{self.base_url}/{method}",
+            json=data or {},
+            timeout=aiohttp.ClientTimeout(total=timeout),
+        ) as response:
+            try:
+                payload = await response.json(content_type=None)
+            except (ValueError, aiohttp.ContentTypeError):
+                payload = {}
+            if response.status != 200 or not payload.get("ok"):
+                raise TelegramApiError(method, payload)
+            return payload.get("result")
+
+    async def _db(self, callable_):
+        return await asyncio.to_thread(_db, callable_)
+
+    async def _remember_chat(self, connection_id: str, chat: dict[str, Any], message_date: int | None = None):
+        chat_id = chat.get("id")
+        if not connection_id or not chat_id:
+            return
+        now = time.time()
+        key = (connection_id, int(chat_id))
+        if now - self.chat_write_times.get(key, 0) < 60:
+            return
+        self.chat_write_times[key] = now
+        seen_at = float(message_date or now)
+
+        def save(conn):
+            conn.execute(
+                """INSERT INTO secretary_chats
+                   (business_connection_id, chat_id, chat_type, title, username, first_name, last_name, last_seen_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(business_connection_id, chat_id) DO UPDATE SET
+                     chat_type=excluded.chat_type, title=excluded.title, username=excluded.username,
+                     first_name=excluded.first_name, last_name=excluded.last_name,
+                     last_seen_at=MAX(secretary_chats.last_seen_at, excluded.last_seen_at)""",
+                (connection_id, int(chat_id), str(chat.get("type") or "private"), chat.get("title"),
+                 chat.get("username"), chat.get("first_name"), chat.get("last_name"), seen_at),
+            )
+
+        await self._db(save)
+
+    async def _remember_chat_safely(self, connection_id: str, chat: dict[str, Any], message_date: int | None = None):
+        try:
+            await self._remember_chat(connection_id, chat, message_date)
+        except Exception:
+            logger.exception("Secretary could not update recent-chat list chat_id=%s", chat.get("id"))
+
+    async def _create_job(self, kind: str, connection_id: str, chat_id: int, *, message_id: int | None = None,
+                          payload: dict[str, Any] | None = None, next_at: float | None = None,
+                          expires_at: float | None = None, job_id: str | None = None):
+        job_id = job_id or uuid.uuid4().hex
+        created = time.time()
+        encoded = json.dumps(payload or {}, ensure_ascii=False, separators=(",", ":"))
+
+        def insert(conn):
+            if kind in {"mute", "typing"}:
+                conn.execute(
+                    "UPDATE secretary_jobs SET status='done' WHERE kind=? AND business_connection_id=? "
+                    "AND chat_id=? AND status='active'",
+                    (kind, connection_id, int(chat_id)),
+                )
+            elif kind in {"type", "hack"}:
+                conn.execute(
+                    "UPDATE secretary_jobs SET status='done' WHERE kind IN ('type','hack') "
+                    "AND business_connection_id=? AND chat_id=? AND status='active'",
+                    (connection_id, int(chat_id)),
+                )
+            conn.execute(
+                "INSERT OR REPLACE INTO secretary_jobs "
+                "(id, kind, business_connection_id, chat_id, message_id, payload, next_at, expires_at, status, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)",
+                (job_id, kind, connection_id, int(chat_id), message_id, encoded,
+                 float(next_at if next_at is not None else created), expires_at, created),
+            )
+
+        await self._db(insert)
+        self.scheduler_wakeup.set()
+        return job_id
+
+    async def _finish_job(self, job_id: str):
+        await self._db(lambda conn: conn.execute(
+            "UPDATE secretary_jobs SET status='done' WHERE id=?", (job_id,)
+        ))
+
+    async def _update_job(self, job_id: str, *, payload: dict[str, Any] | None = None,
+                          next_at: float | None = None, expires_at: float | None = None,
+                          message_id: int | None = None):
+        fields, values = [], []
+        if payload is not None:
+            fields.append("payload=?")
+            values.append(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+        if next_at is not None:
+            fields.append("next_at=?")
+            values.append(float(next_at))
+        if expires_at is not None:
+            fields.append("expires_at=?")
+            values.append(float(expires_at))
+        if message_id is not None:
+            fields.append("message_id=?")
+            values.append(int(message_id))
+        if not fields:
+            return
+        values.append(job_id)
+        await self._db(lambda conn: conn.execute(
+            f"UPDATE secretary_jobs SET {', '.join(fields)} WHERE id=? AND status='active'", tuple(values)
+        ))
+        if next_at is not None:
+            self.scheduler_wakeup.set()
+
+    async def _load_startup_state(self):
+        def load(conn):
+            conn.execute("DELETE FROM secretary_jobs WHERE status='done' AND created_at<?", (time.time() - 30 * 86400,))
+            jobs = conn.execute(
+                "SELECT * FROM secretary_jobs WHERE status='active' ORDER BY next_at"
+            ).fetchall()
+            meta = conn.execute(
+                "SELECT value FROM secretary_meta WHERE key='last_update_id'"
+            ).fetchone()
+            return [_row_to_dict(row) for row in jobs], int(meta["value"]) + 1 if meta else None
+
+        jobs, offset = await self._db(load)
+        for job in jobs:
+            if job["kind"] == "mute" and job.get("expires_at"):
+                self.active_mutes[(job["business_connection_id"], int(job["chat_id"]))] = float(job["expires_at"])
+        return jobs, offset
+
+    async def _save_offset(self, update_id: int):
+        await self._db(lambda conn: conn.execute(
+            "INSERT INTO secretary_meta(key, value) VALUES('last_update_id', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(update_id),)
+        ))
+
+    async def _list_chats(self):
+        def load(conn):
+            rows = conn.execute(
+                "SELECT business_connection_id, chat_id, chat_type, title, username, first_name, last_name "
+                "FROM secretary_chats WHERE chat_type='private' ORDER BY last_seen_at DESC LIMIT 20"
+            ).fetchall()
+            return [_row_to_dict(row) for row in rows]
+        return await self._db(load)
+
+    async def _get_chat(self, chat_id: int):
+        return await self._db(lambda conn: _row_to_dict(conn.execute(
+            "SELECT * FROM secretary_chats WHERE chat_id=? ORDER BY last_seen_at DESC LIMIT 1", (int(chat_id),)
+        ).fetchone()))
+
+    async def _set_session(self, owner_id: int, connection_id: str, chat_id: int):
+        await self._db(lambda conn: conn.execute(
+            "INSERT INTO secretary_sessions(owner_id, business_connection_id, chat_id, updated_at) VALUES(?, ?, ?, ?) "
+            "ON CONFLICT(owner_id) DO UPDATE SET business_connection_id=excluded.business_connection_id, "
+            "chat_id=excluded.chat_id, updated_at=excluded.updated_at",
+            (int(owner_id), connection_id, int(chat_id), time.time()),
+        ))
+
+    async def _get_session(self, owner_id: int):
+        return await self._db(lambda conn: _row_to_dict(conn.execute(
+            "SELECT c.* FROM secretary_sessions s JOIN secretary_chats c "
+            "ON c.business_connection_id=s.business_connection_id AND c.chat_id=s.chat_id WHERE s.owner_id=?",
+            (int(owner_id),),
+        ).fetchone()))
+
+    @staticmethod
+    def _chat_label(chat: dict[str, Any]) -> str:
+        title = chat.get("title") or " ".join(filter(None, [chat.get("first_name"), chat.get("last_name")]))
+        if not title:
+            title = f"Чат {chat.get('chat_id')}"
+        if chat.get("username"):
+            title += f" (@{chat['username']})"
+        return title[:60]
+
+    async def _show_chats(self, chat_id: int):
+        chats = await self._list_chats()
+        if not chats:
+            await self._api("sendMessage", {"chat_id": chat_id, "text":
+                "Пока не видел чатов через Secretary Mode. Сначала включи секретаря для нужного чата и отправь там сообщение."})
+            return
+        keyboard = []
+        for chat in chats:
+            keyboard.append([{"text": self._chat_label(chat), "callback_data": f"sec:{chat['chat_id']}"}])
+        await self._api("sendMessage", {
+            "chat_id": chat_id,
+            "text": "Выбери недавний чат. После выбора пришли сюда команду, например `.type привет` или `.mute`.",
+            "reply_markup": {"inline_keyboard": keyboard},
+        })
+
+    async def _send_dm_help(self, chat_id: int):
+        await self._api("sendMessage", {"chat_id": chat_id, "text":
+            "Команды в выбранном чате:\n"
+            "`.mute` — удалить сообщения собеседника минуту; `.unmute` — снять режим\n"
+            "`.typing 30min` — показывать «печатает» заданное время\n"
+            "`.type текст` — показать текст поэтапно\n"
+            "`.del 100 текст` — отправить текст и удалить его через 100 секунд\n"
+            "`.spam 5 текст` — отправить текст 5 раз\n"
+            "`.hack`, `.flip текст`, `.tiny текст`\n\n/chats — выбрать чат заново"})
+
+    async def _callback(self, update: dict[str, Any]):
+        query = update.get("callback_query") or {}
+        sender = query.get("from") or {}
+        message = query.get("message") or {}
+        callback_data = str(query.get("data") or "")
+        if int(sender.get("id") or 0) != self.owner_id or not callback_data.startswith("sec:"):
+            await self._api("answerCallbackQuery", {"callback_query_id": query.get("id"), "text": "Нет доступа", "show_alert": True})
+            return
+        try:
+            target_id = int(callback_data.split(":", 1)[1])
+        except ValueError:
+            await self._api("answerCallbackQuery", {"callback_query_id": query.get("id"), "text": "Некорректный чат"})
+            return
+        target = await self._get_chat(target_id)
+        if not target:
+            await self._api("answerCallbackQuery", {"callback_query_id": query.get("id"), "text": "Чат уже недоступен. Нажми /chats"})
+            return
+        await self._set_session(self.owner_id, target["business_connection_id"], target_id)
+        await self._api("answerCallbackQuery", {"callback_query_id": query.get("id"), "text": "Чат выбран"})
+        with suppress(Exception):
+            if message.get("chat") and message.get("message_id"):
+                await self._api("editMessageText", {
+                    "chat_id": message["chat"]["id"], "message_id": message["message_id"],
+                    "text": f"Выбран чат: {self._chat_label(target)}. Пришли команду с текстом или /help.",
+                })
+
+    async def _handle_dm(self, message: dict[str, Any]):
+        sender = message.get("from") or {}
+        if int(sender.get("id") or 0) != self.owner_id:
+            return
+        control_chat = message.get("chat") or {}
+        if control_chat.get("type") != "private":
+            return
+        chat_id = int(control_chat.get("id") or 0)
+        text = str(message.get("text") or "").strip()
+        if not chat_id or not text:
+            return
+        command = text.split(maxsplit=1)[0].split("@", 1)[0].lower()
+        if command in {"/start", "/chats"}:
+            await self._show_chats(chat_id)
+            return
+        if command in {"/help"}:
+            await self._send_dm_help(chat_id)
+            return
+        if command in {"/cancel"}:
+            await self._db(lambda conn: conn.execute("DELETE FROM secretary_sessions WHERE owner_id=?", (self.owner_id,)))
+            await self._api("sendMessage", {"chat_id": chat_id, "text": "Выбор чата сброшен. Напиши /chats, чтобы выбрать снова."})
+            return
+        if not text.startswith("."):
+            return
+        target = await self._get_session(self.owner_id)
+        if not target:
+            await self._show_chats(chat_id)
+            return
+        await self._execute(text, target["business_connection_id"], int(target["chat_id"]), source=None)
+
+    async def _handle_business_message(self, message: dict[str, Any]):
+        connection_id = str(message.get("business_connection_id") or "")
+        chat = message.get("chat") or {}
+        chat_id = int(chat.get("id") or 0)
+        sender = message.get("from") or {}
+        sender_id = int(sender.get("id") or 0)
+        if not connection_id or not chat_id or chat.get("type") != "private":
+            return
+        # Even with Bot-to-Bot mode enabled, automated actions only react to
+        # messages from human participants, never to another bot's output.
+        if sender.get("is_bot"):
+            return
+
+        # Deletion is handled from the in-memory timer map so no Turso round-trip
+        # sits in front of the fastest path.
+        mute_key = (connection_id, chat_id)
+        mute_expiry = self.active_mutes.get(mute_key)
+        if sender_id != self.owner_id and mute_expiry:
+            if mute_expiry > time.time():
+                try:
+                    await self._api("deleteBusinessMessages", {
+                        "business_connection_id": connection_id, "message_ids": [int(message["message_id"])],
+                    })
+                except TelegramApiError as error:
+                    logger.warning("Secretary mute delete failed chat_id=%s: %s", chat_id, error)
+                return
+            self.active_mutes.pop(mute_key, None)
+
+        asyncio.create_task(self._remember_chat_safely(connection_id, chat, message.get("date")))
+        if sender_id != self.owner_id or sender.get("is_bot"):
+            return
+        text = str(message.get("text") or "").strip()
+        if text.startswith("."):
+            await self._execute(text, connection_id, chat_id, source=message)
+
+    async def _handle_update(self, update: dict[str, Any]):
+        if update.get("business_connection"):
+            connection = update["business_connection"]
+            connection_id = str(connection.get("id") or "")
+            rights = connection.get("rights") or {}
+            logger.info(
+                "Secretary business connection enabled=%s can_reply=%s can_delete_all_messages=%s",
+                bool(connection.get("is_enabled")), bool(rights.get("can_reply")),
+                bool(rights.get("can_delete_all_messages")),
+            )
+            if connection_id and not connection.get("is_enabled"):
+                for key in [key for key in self.active_mutes if key[0] == connection_id]:
+                    self.active_mutes.pop(key, None)
+                await self._db(lambda conn: conn.execute(
+                    "UPDATE secretary_jobs SET status='done' WHERE business_connection_id=? AND status='active'",
+                    (connection_id,),
+                ))
+            return
+        if update.get("business_message"):
+            await self._handle_business_message(update["business_message"])
+        elif update.get("message"):
+            await self._handle_dm(update["message"])
+        elif update.get("callback_query"):
+            await self._callback(update)
+
+    @staticmethod
+    def _duration(raw: str) -> int | None:
+        match = DURATION_RE.fullmatch(raw.strip().lower())
+        if not match:
+            return None
+        amount = int(match.group(1))
+        unit = match.group(2) or "s"
+        factor = 60 if unit in {"m", "min", "мин"} else 3600 if unit in {"h", "час"} else 86400 if unit in {"d", "д"} else 1
+        return amount * factor if amount > 0 else None
+
+    async def _edit_or_send(self, connection_id: str, chat_id: int, source: dict[str, Any] | None,
+                            text: str, *, delete_source: bool = False) -> int | None:
+        if source:
+            message_id = int(source["message_id"])
+            if delete_source:
+                await self._api("deleteBusinessMessages", {
+                    "business_connection_id": connection_id, "message_ids": [message_id],
+                })
+                return None
+            await self._api("editMessageText", {
+                "business_connection_id": connection_id, "chat_id": chat_id,
+                "message_id": message_id, "text": text,
+            })
+            return message_id
+        sent = await self._api("sendMessage", {
+            "business_connection_id": connection_id, "chat_id": chat_id, "text": text,
+        })
+        return int(sent["message_id"])
+
+    async def _execute(self, command_text: str, connection_id: str, chat_id: int, *, source: dict[str, Any] | None):
+        match = COMMAND_RE.match(command_text.strip())
+        if not match:
+            return
+        command = match.group(1).lower()
+        args = (match.group(2) or "").strip()
+        now = time.time()
+        mute_key = (connection_id, chat_id)
+
+        try:
+            if command == "mute":
+                expires = now + 60
+                self.active_mutes[mute_key] = expires
+                await self._edit_or_send(connection_id, chat_id, source, "Тише зайка")
+                await self._create_job("mute", connection_id, chat_id, next_at=expires, expires_at=expires)
+                return
+
+            if command == "unmute":
+                self.active_mutes.pop(mute_key, None)
+                await self._edit_or_send(connection_id, chat_id, source, "Можно говорить 🙂")
+                await self._db(lambda conn: conn.execute(
+                    "UPDATE secretary_jobs SET status='done' WHERE kind='mute' AND business_connection_id=? AND chat_id=? AND status='active'",
+                    (connection_id, chat_id),
+                ))
+                return
+
+            if command == "typing":
+                if args.lower() in {"stop", "off", "0"}:
+                    await self._edit_or_send(connection_id, chat_id, source, "Печать остановлена")
+                    await self._db(lambda conn: conn.execute(
+                        "UPDATE secretary_jobs SET status='done' WHERE kind='typing' AND business_connection_id=? AND chat_id=? AND status='active'",
+                        (connection_id, chat_id),
+                    ))
+                    return
+                duration = self._duration(args) if args else None
+                if not duration:
+                    await self._edit_or_send(connection_id, chat_id, source, "Формат: .typing 30min")
+                    return
+                expires = now + duration
+                await self._edit_or_send(connection_id, chat_id, source, "ща чо расскажу вам")
+                await self._api("sendChatAction", {
+                    "business_connection_id": connection_id, "chat_id": chat_id, "action": "typing",
+                })
+                await self._create_job("typing", connection_id, chat_id, next_at=now + 4, expires_at=expires)
+                return
+
+            if command in {"type", "del", "flip", "tiny"} and not args:
+                await self._edit_or_send(connection_id, chat_id, source, f"Формат: .{command} текст")
+                return
+
+            if command == "type":
+                text = args[:4096]
+                step = max(1, math.ceil(len(text) / 12))
+                first = text[:step]
+                message_id = await self._edit_or_send(connection_id, chat_id, source, first)
+                if len(first) < len(text) and message_id:
+                    await self._create_job("type", connection_id, chat_id, message_id=message_id,
+                        payload={"text": text, "cursor": len(first), "step": step}, next_at=now + 0.5)
+                return
+
+            if command == "del":
+                delete_match = re.match(r"^(?:(\d+)\s+)?([\s\S]+)$", args)
+                seconds = int(delete_match.group(1) or 100) if delete_match else 100
+                text = (delete_match.group(2) if delete_match else args).strip()[:4096]
+                if not text:
+                    await self._edit_or_send(connection_id, chat_id, source, "Формат: .del 100 текст")
+                    return
+                message_id = await self._edit_or_send(connection_id, chat_id, source, text)
+                if message_id:
+                    await self._create_job("delete", connection_id, chat_id, message_id=message_id,
+                        next_at=now + max(1, seconds), expires_at=now + max(1, seconds))
+                return
+
+            if command == "spam":
+                spam_match = re.match(r"^(\d+)\s+([\s\S]+)$", args)
+                if not spam_match:
+                    await self._edit_or_send(connection_id, chat_id, source, "Формат: .spam 5 текст")
+                    return
+                count, text = int(spam_match.group(1)), spam_match.group(2).strip()[:4096]
+                if count < 1 or not text:
+                    await self._edit_or_send(connection_id, chat_id, source, "Формат: .spam 5 текст")
+                    return
+                if source:
+                    await self._edit_or_send(connection_id, chat_id, source, "", delete_source=True)
+                await self._create_job("spam", connection_id, chat_id,
+                    payload={"text": text, "remaining": count}, next_at=now)
+                return
+
+            if command == "hack":
+                stages = ["Подключаюсь к серверу…", "Проверяю уровень доступа…", "Загружаю мемы…"]
+                message_id = await self._edit_or_send(connection_id, chat_id, source, stages[0])
+                if message_id:
+                    await self._create_job("hack", connection_id, chat_id, message_id=message_id,
+                        payload={"stages": stages, "index": 1}, next_at=now + 0.45)
+                return
+
+            if command == "flip":
+                result = args.translate(FLIP_MAP)[::-1]
+                await self._edit_or_send(connection_id, chat_id, source, result[:4096])
+                return
+
+            if command == "tiny":
+                await self._edit_or_send(connection_id, chat_id, source, args.translate(TINY_MAP)[:4096])
+                return
+        except TelegramApiError as error:
+            logger.warning("Secretary action failed command=%s chat_id=%s code=%s: %s", command, chat_id, error.code, error)
+            if source and error.code in {400, 403}:
+                # Do not expose technical details in the target chat; the failed
+                # API request itself leaves the original command available.
+                pass
+        except Exception:
+            logger.exception("Secretary action failed command=%s chat_id=%s", command, chat_id)
+
+    async def _run_job(self, job: dict[str, Any]):
+        job_id = job["id"]
+        kind = job["kind"]
+        connection_id = job["business_connection_id"]
+        chat_id = int(job["chat_id"])
+        message_id = int(job["message_id"] or 0)
+        try:
+            if kind == "mute":
+                key = (connection_id, chat_id)
+                if float(job.get("expires_at") or 0) <= time.time():
+                    self.active_mutes.pop(key, None)
+                    await self._finish_job(job_id)
+                else:
+                    await self._update_job(job_id, next_at=float(job["expires_at"]))
+                return
+
+            if kind == "typing":
+                expires = float(job.get("expires_at") or 0)
+                if expires <= time.time():
+                    await self._finish_job(job_id)
+                    return
+                await self._api("sendChatAction", {
+                    "business_connection_id": connection_id, "chat_id": chat_id, "action": "typing",
+                })
+                await self._update_job(job_id, next_at=min(time.time() + 4, expires))
+                return
+
+            if kind == "delete":
+                if float(job.get("expires_at") or 0) <= time.time():
+                    await self._api("deleteBusinessMessages", {
+                        "business_connection_id": connection_id, "message_ids": [message_id],
+                    })
+                    await self._finish_job(job_id)
+                return
+
+            payload = json.loads(job.get("payload") or "{}")
+            if kind == "spam":
+                remaining = int(payload.get("remaining") or 0)
+                if remaining <= 0:
+                    await self._finish_job(job_id)
+                    return
+                await self._api("sendMessage", {
+                    "business_connection_id": connection_id, "chat_id": chat_id,
+                    "text": str(payload.get("text") or "")[:4096],
+                })
+                remaining -= 1
+                if remaining <= 0:
+                    await self._finish_job(job_id)
+                else:
+                    payload["remaining"] = remaining
+                    await self._update_job(job_id, payload=payload, next_at=time.time() + 1.05)
+                return
+
+            if kind == "type":
+                text = str(payload.get("text") or "")
+                cursor = int(payload.get("cursor") or 0)
+                step = max(1, int(payload.get("step") or 1))
+                cursor = min(len(text), cursor + step)
+                await self._api("editMessageText", {
+                    "business_connection_id": connection_id, "chat_id": chat_id,
+                    "message_id": message_id, "text": text[:cursor],
+                })
+                if cursor >= len(text):
+                    await self._finish_job(job_id)
+                else:
+                    payload["cursor"] = cursor
+                    await self._update_job(job_id, payload=payload, next_at=time.time() + 0.5)
+                return
+
+            if kind == "hack":
+                stages = payload.get("stages") or []
+                index = int(payload.get("index") or 0)
+                if index >= len(stages):
+                    await self._api("editMessageText", {
+                        "business_connection_id": connection_id, "chat_id": chat_id,
+                        "message_id": message_id, "text": "Взлом завершён: доступ к мемам получен 😎",
+                    })
+                    await self._finish_job(job_id)
+                else:
+                    await self._api("editMessageText", {
+                        "business_connection_id": connection_id, "chat_id": chat_id,
+                        "message_id": message_id, "text": str(stages[index]),
+                    })
+                    payload["index"] = index + 1
+                    await self._update_job(job_id, payload=payload, next_at=time.time() + 0.45)
+        except TelegramApiError as error:
+            if error.retry_after:
+                await self._update_job(job_id, next_at=time.time() + int(error.retry_after) + 1)
+                return
+            logger.warning("Secretary scheduled action failed kind=%s chat_id=%s: %s", kind, chat_id, error)
+            if kind == "mute":
+                self.active_mutes.pop((connection_id, chat_id), None)
+            await self._finish_job(job_id)
+        except Exception:
+            logger.exception("Secretary scheduled action failed kind=%s chat_id=%s", kind, chat_id)
+            await self._update_job(job_id, next_at=time.time() + 10)
+
+    async def _scheduler(self):
+        while True:
+            try:
+                self.scheduler_wakeup.clear()
+                next_due = await self._db(lambda conn: (conn.execute(
+                    "SELECT MIN(next_at) AS due FROM secretary_jobs WHERE status='active'"
+                ).fetchone() or {"due": None})["due"])
+                delay = 30 if next_due is None else max(0, min(30, float(next_due) - time.time()))
+                if delay > 0:
+                    try:
+                        await asyncio.wait_for(self.scheduler_wakeup.wait(), timeout=delay)
+                        continue
+                    except asyncio.TimeoutError:
+                        pass
+                due = await self._db(lambda conn: [
+                    _row_to_dict(row) for row in conn.execute(
+                        "SELECT * FROM secretary_jobs WHERE status='active' AND next_at<=? ORDER BY next_at LIMIT 20",
+                        (time.time(),),
+                    ).fetchall()
+                ])
+                for job in due:
+                    await self._run_job(job)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Secretary scheduler iteration failed")
+            await asyncio.sleep(1)
+
+    async def _poll(self, offset: int | None):
+        info = await self._api("getWebhookInfo")
+        if info and info.get("url"):
+            raise RuntimeError("Secretary bot has a webhook configured; remove it in Telegram before enabling polling.")
+        for method, data in [
+            ("setMyCommands", {"commands": [
+                {"command": "start", "description": "Открыть секретаря"},
+                {"command": "chats", "description": "Выбрать чат"},
+                {"command": "help", "description": "Помощь"},
+                {"command": "cancel", "description": "Сбросить выбранный чат"},
+            ]}),
+            ("setMyDescription", {"description": "Личный секретарь для быстрых команд в выбранных Telegram-чатах."}),
+            ("setMyShortDescription", {"short_description": "Личный Telegram-секретарь"}),
+        ]:
+            try:
+                await self._api(method, data)
+            except TelegramApiError as error:
+                logger.warning("Secretary bot profile setup failed method=%s: %s", method, error)
+        if self.scheduler_task is None or self.scheduler_task.done():
+            self.scheduler_task = asyncio.create_task(self._scheduler(), name="secretary-scheduler")
+        while True:
+            try:
+                params: dict[str, Any] = {"timeout": 25, "allowed_updates": [
+                    "message", "callback_query", "business_connection", "business_message", "edited_business_message",
+                ]}
+                if offset is not None:
+                    params["offset"] = offset
+                updates = await self._api("getUpdates", params, timeout=40)
+                for update in updates or []:
+                    update_id = int(update.get("update_id", 0))
+                    try:
+                        await self._handle_update(update)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.exception("Secretary update handler failed update_id=%s", update_id)
+                    await self._save_offset(update_id)
+                    offset = update_id + 1
+            except asyncio.CancelledError:
+                raise
+            except TelegramApiError as error:
+                if error.retry_after:
+                    await asyncio.sleep(int(error.retry_after) + 1)
+                else:
+                    logger.error("Secretary polling failed code=%s: %s", error.code, error)
+                    await asyncio.sleep(5)
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                logger.warning("Secretary polling network error; retrying")
+                await asyncio.sleep(3)
+            except Exception:
+                logger.exception("Secretary polling loop failed")
+                await asyncio.sleep(5)
+
+    async def run(self):
+        if not self.token:
+            return
+        self.session = aiohttp.ClientSession(
+            connector=aiohttp.TCPConnector(limit=20, ttl_dns_cache=300),
+            headers={"User-Agent": "UtilBot-Secretary/1.0"},
+        )
+        try:
+            _, offset = await self._load_startup_state()
+            while True:
+                try:
+                    me = await self._api("getMe")
+                    logger.info("Secretary bot started username=@%s owner_id=%s", me.get("username"), self.owner_id)
+                    await self._poll(offset)
+                except asyncio.CancelledError:
+                    raise
+                except RuntimeError as error:
+                    if "webhook configured" in str(error):
+                        logger.error("Secretary bot cannot start polling: %s", error)
+                        return
+                    logger.exception("Secretary bot startup failed; retrying")
+                    await asyncio.sleep(10)
+                except Exception:
+                    logger.exception("Secretary bot polling stopped unexpectedly; retrying")
+                    await asyncio.sleep(5)
+        finally:
+            if self.scheduler_task:
+                self.scheduler_task.cancel()
+                try:
+                    await self.scheduler_task
+                except asyncio.CancelledError:
+                    pass
+            await self.session.close()
+            self.session = None

@@ -75,6 +75,7 @@ from src.services.media_service import MediaService
 from src.services.chatgpt_ocr_service import ChatGptOcrService
 from src.services.chatgpt_ai_service import ChatGptAiService
 from src.services.groq_transcription_service import GroqTranscriptionService
+from src.services.secretary_service import SecretaryService
 from src.services.link_service import LinkService
 from src.services.rss_service import RSSService
 from src.states.save_state import SaveStates
@@ -3629,6 +3630,7 @@ async def go_home_handler(callback: CallbackQuery, state: FSMContext):
 async def main():
     global health_server
     init_db()
+    secretary_service = SecretaryService(settings) if settings.secretary_bot_token else None
 
     try:
         webhook = await bot.get_webhook_info()
@@ -3660,6 +3662,16 @@ async def main():
             interval_seconds=settings.backup_interval_hours * 3600,
         )
     )
+    secretary_task = asyncio.create_task(secretary_service.run()) if secretary_service else None
+    if secretary_task:
+        def log_secretary_failure(task: asyncio.Task):
+            if task.cancelled():
+                return
+            error = task.exception()
+            if error:
+                logging.error("Secretary bot stopped: %s", error,
+                              exc_info=(type(error), error, error.__traceback__))
+        secretary_task.add_done_callback(log_secretary_failure)
 
     logging.info("Starting Telegram polling for %d allowed user IDs...", len(effective_allowed_user_ids(settings)))
     try:
@@ -3668,12 +3680,17 @@ async def main():
         reminder_task.cancel()
         rss_task.cancel()
         backup_task.cancel()
+        if secretary_task:
+            secretary_task.cancel()
         with suppress(asyncio.CancelledError):
             await reminder_task
         with suppress(asyncio.CancelledError):
             await rss_task
         with suppress(asyncio.CancelledError):
             await backup_task
+        if secretary_task:
+            with suppress(asyncio.CancelledError, Exception):
+                await secretary_task
         if health_server is not None:
             with suppress(Exception):
                 await health_server.stop()

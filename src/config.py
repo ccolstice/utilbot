@@ -41,6 +41,8 @@ def _env_int(name: str, default: int) -> int:
 @dataclass(slots=True)
 class Settings:
     bot_token: str
+    secretary_bot_token: str
+    secretary_owner_user_id: int
     allowed_user_ids: set[int]
     owner_user_ids: set[int]
     database_path: Path
@@ -68,6 +70,10 @@ def get_settings() -> Settings:
     render_free_mode = _env_bool("RENDER_FREE_MODE", "0")
     allowed_user_ids = _parse_ids(os.getenv("ALLOWED_USER_IDS"))
     owner_user_ids = _parse_ids(os.getenv("OWNER_USER_IDS"))
+    secretary_bot_token = os.getenv("SECRETARY_BOT_TOKEN", "").strip()
+    secretary_owner_user_id = _env_int("SECRETARY_OWNER_USER_ID", 0)
+    if secretary_bot_token and secretary_owner_user_id <= 0:
+        raise RuntimeError("SECRETARY_BOT_TOKEN requires SECRETARY_OWNER_USER_ID.")
     chatgpt_ocr_url = os.getenv("CHATGPT_OCR_URL", "").strip().rstrip("/")
     chatgpt_ocr_token = os.getenv("CHATGPT_OCR_TOKEN", "").strip()
     chatgpt_ai_url = os.getenv("CHATGPT_AI_URL", "").strip().rstrip("/")
@@ -90,6 +96,8 @@ def get_settings() -> Settings:
 
     return Settings(
         bot_token=bot_token,
+        secretary_bot_token=secretary_bot_token,
+        secretary_owner_user_id=secretary_owner_user_id,
         allowed_user_ids=allowed_user_ids,
         owner_user_ids=owner_user_ids,
         database_path=db_path,
