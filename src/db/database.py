@@ -72,16 +72,9 @@ class _TursoConnection:
         return _TursoCursor(self._connection.execute(sql, parameters))
 
     def executescript(self, script):
-        # sqlite3.complete_statement correctly handles semicolons inside strings.
-        statement = ""
-        for line in script.splitlines(keepends=True):
-            statement += line
-            if sqlite3.complete_statement(statement):
-                if statement.strip():
-                    self.execute(statement)
-                statement = ""
-        if statement.strip():
-            self.execute(statement)
+        # Use the serverless driver's pipeline so schema initialization runs
+        # without keeping one remote transaction open across many requests.
+        self._connection.executescript(script)
 
     def commit(self):
         self._connection.commit()
@@ -100,10 +93,10 @@ def get_connection():
         if not url or not token:
             raise RuntimeError("DATABASE_BACKEND=turso requires TURSO_DATABASE_URL and TURSO_AUTH_TOKEN; refusing local fallback")
         try:
-            import libsql
+            import turso_serverless
         except ImportError as exc:
             raise RuntimeError("Turso driver is missing. Rebuild the deployment with requirements.txt.") from exc
-        return _TursoConnection(libsql.connect(database=url, auth_token=token))
+        return _TursoConnection(turso_serverless.connect(url, auth_token=token))
     conn = sqlite3.connect(DATABASE_FILE)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON;")
