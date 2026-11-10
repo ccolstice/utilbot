@@ -28,7 +28,7 @@ class ChatGptAiService:
     @staticmethod
     async def generate_secretary_reply(settings: Settings, user_id: int, mode: str, context: str,
                                        *, image_base64: str = "", mime_type: str = "") -> str:
-        if mode not in {"bydlo", "troll", "office"}:
+        if mode not in {"bydlo", "troll", "office", "reshala"}:
             raise ValueError("Неизвестный режим ИИ-секретаря.")
         if not settings.chatgpt_ai_url or not settings.chatgpt_ai_token:
             raise RuntimeError("Связь секретаря с SIWC не настроена.")
