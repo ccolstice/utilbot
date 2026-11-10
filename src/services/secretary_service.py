@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import re
 import time
 import uuid
@@ -61,14 +62,35 @@ class TelegramApiError(RuntimeError):
         super().__init__(str(payload.get("description") or f"Telegram API {method} failed"))
 
 
+class SecretaryPollingConflict(RuntimeError):
+    """Another process is already polling this secretary bot token."""
+
+
 def _db(callable_):
-    conn = get_connection()
-    try:
-        result = callable_(conn)
-        conn.commit()
-        return result
-    finally:
-        conn.close()
+    # A failed Turso interactive transaction is rolled back remotely. Retry
+    # the complete database-only callback on a fresh connection so a transient
+    # Hrana SQLITE_BUSY does not strand time-sensitive jobs such as .type.
+    delays = (0.15, 0.35, 0.75, 1.5)
+    for attempt in range(len(delays) + 1):
+        conn = get_connection()
+        try:
+            result = callable_(conn)
+            conn.commit()
+            return result
+        except Exception as error:
+            message = str(error).lower()
+            retryable = "sqlite_busy" in message or "database is locked" in message
+            if not retryable or attempt >= len(delays):
+                raise
+            with suppress(Exception):
+                conn.rollback()
+            delay = delays[attempt] + random.uniform(0, 0.1)
+            logger.warning("Secretary DB transaction busy; retrying attempt=%s/%s in %.2fs",
+                           attempt + 1, len(delays), delay)
+            time.sleep(delay)
+        finally:
+            with suppress(Exception):
+                conn.close()
 
 
 def _row_to_dict(row) -> dict[str, Any] | None:
@@ -798,8 +820,23 @@ class SecretaryService:
                 await self._delete_message(connection_id, chat_id, message_id)
                 return None
             if connection_id:
-                await self._edit_message(connection_id, chat_id, message_id, text)
-                return message_id
+                try:
+                    await self._edit_message(connection_id, chat_id, message_id, text)
+                    return message_id
+                except TelegramApiError as error:
+                    if error.code != 400 or "message_id_invalid" not in str(error).lower():
+                        raise
+                    # A duplicate/stale update can arrive after another
+                    # polling process already edited or removed this command.
+                    # Preserve the requested action by sending its replacement.
+                    logger.warning("Secretary source message is no longer editable; sending replacement chat_id=%s message_id=%s",
+                                   chat_id, message_id)
+                    try:
+                        await self._delete_message(connection_id, chat_id, message_id)
+                    except TelegramApiError as delete_error:
+                        if delete_error.code != 400 or "message_id_invalid" not in str(delete_error).lower():
+                            raise
+                    return await self._send_message(connection_id, chat_id, text)
             # Group messages belong to their sender: delete the command and
             # send the replacement from the secretary bot itself.
             await self._delete_message("", chat_id, message_id)
@@ -1114,6 +1151,12 @@ class SecretaryService:
             except TelegramApiError as error:
                 if error.retry_after:
                     await asyncio.sleep(int(error.retry_after) + 1)
+                elif error.code == 409:
+                    logger.error(
+                        "Secretary polling stopped: another process is using getUpdates for this bot token; "
+                        "keep one Render instance and stop any local/duplicate deployment"
+                    )
+                    raise SecretaryPollingConflict from error
                 else:
                     logger.error("Secretary polling failed code=%s: %s", error.code, error)
                     await asyncio.sleep(5)
@@ -1140,6 +1183,10 @@ class SecretaryService:
                     await self._poll(offset)
                 except asyncio.CancelledError:
                     raise
+                except SecretaryPollingConflict:
+                    # Retrying would make duplicate pollers alternately evict
+                    # each other and cause repeated command failures.
+                    return
                 except RuntimeError as error:
                     if "webhook configured" in str(error):
                         logger.error("Secretary bot cannot start polling: %s", error)
