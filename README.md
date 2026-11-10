@@ -93,3 +93,11 @@
 ## Turso Cloud
 
 Turso can be used as the active database with `DATABASE_BACKEND=turso`. Set `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` in the environment. Use `scripts/import_sqlite_to_turso.py` to import an existing SQLite snapshot into a new, empty test database; the source snapshot is left unchanged. The importer refuses to overwrite a non-empty database unless `--replace-existing` is explicitly supplied.
+
+## Telegram Secretary bot
+
+The optional secretary bot runs beside UtilBot in this same Render service. In Render → `gembabot` → Environment, add `SECRETARY_BOT_TOKEN` with the token from BotFather for the new bot, and `SECRETARY_OWNER_USER_ID` with your numeric Telegram user ID (the same ID used in `OWNER_USER_IDS`). Keep the existing `BOT_TOKEN` unchanged. The secretary's recent-chat list and timed actions use the currently configured database, including Turso when `DATABASE_BACKEND=turso`.
+
+After deployment, start a private chat with the new bot and press Start. In Telegram's Business settings, connect this bot and select the chats it may manage; grant message reply/edit and delete permissions if Telegram offers them. A chat appears in `/chats` after the secretary has received a message from it. In a connected private chat, send `.mute`, `.typing 30min`, `.type текст`, `.del 100 текст`, `.spam 5 текст`, `.hack`, `.flip текст`, or `.tiny текст` directly. The command message is edited or deleted as the first Telegram action; Telegram may still display it briefly while that request is in flight. In the secretary bot's private chat, use `/chats` to choose a target and then send the same dot command as a fallback.
+
+This feature does not connect to the SIWC/ChatGPT bot. It uses a separate BotFather token and a separate Telegram polling loop inside the existing UtilBot process.
