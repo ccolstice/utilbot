@@ -211,6 +211,7 @@ def init_db():
         last_notified_at TIMESTAMP DEFAULT NULL,
         next_retry_at TIMESTAMP DEFAULT NULL,
         retry_count INTEGER DEFAULT 0,
+        delivery_failures INTEGER NOT NULL DEFAULT 0,
         source_item_id INTEGER DEFAULT NULL,
         note TEXT DEFAULT NULL
     );
@@ -289,6 +290,15 @@ def init_db():
     CREATE TABLE IF NOT EXISTS secretary_meta (
         key TEXT PRIMARY KEY,
         value TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS secretary_update_failures (
+        update_id INTEGER PRIMARY KEY,
+        payload TEXT NOT NULL,
+        error TEXT,
+        attempts INTEGER NOT NULL DEFAULT 1,
+        dead_letter INTEGER NOT NULL DEFAULT 0,
+        updated_at REAL NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS secretary_message_snapshots (
@@ -424,6 +434,7 @@ def init_db():
     _ensure_column(conn, "reminders", "last_notified_at TIMESTAMP DEFAULT NULL")
     _ensure_column(conn, "reminders", "next_retry_at TIMESTAMP DEFAULT NULL")
     _ensure_column(conn, "reminders", "retry_count INTEGER DEFAULT 0")
+    _ensure_column(conn, "reminders", "delivery_failures INTEGER NOT NULL DEFAULT 0")
     _ensure_column(conn, "reminders", "source_item_id INTEGER DEFAULT NULL")
     _ensure_column(conn, "reminders", "note TEXT DEFAULT NULL")
 

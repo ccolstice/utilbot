@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta
 from math import ceil
 
@@ -118,7 +119,7 @@ async def _edit_text_or_send(target, text: str, reply_markup=None):
 
 
 async def show_reminders_page(target, user_id: int, page: int, *, edit: bool = False):
-    rows = ReminderService.list_reminders(user_id, include_done=False, limit=100)
+    rows = await asyncio.to_thread(ReminderService.list_reminders, user_id, include_done=False, limit=100)
     if not rows:
         if edit and isinstance(target, CallbackQuery):
             await _send_text(
@@ -267,7 +268,7 @@ async def remind_repeat_callback(callback: CallbackQuery, state: FSMContext):
     repeat_raw = callback.data.replace("remind_repeat_", "")
     repeat_minutes = None if repeat_raw == "none" else int(repeat_raw)
 
-    reminder = ReminderService.create_reminder(
+    reminder = await asyncio.to_thread(ReminderService.create_reminder,
         user_id=callback.from_user.id,
         title=title,
         due_at=datetime.fromisoformat(due_at),
@@ -296,7 +297,7 @@ async def open_reminder_callback(callback: CallbackQuery):
     parts = callback.data.split("_")
     reminder_id = int(parts[2])
     page = int(parts[3])
-    row = ReminderService.get_reminder(callback.from_user.id, reminder_id)
+    row = await asyncio.to_thread(ReminderService.get_reminder, callback.from_user.id, reminder_id)
     if not row:
         await callback.answer("Напоминание не найдено", show_alert=True)
         return
@@ -309,16 +310,16 @@ async def reminder_done_callback(callback: CallbackQuery):
     reminder_id = int(parts[2])
     page = int(parts[3])
 
-    row = ReminderService.get_reminder(callback.from_user.id, reminder_id)
+    row = await asyncio.to_thread(ReminderService.get_reminder, callback.from_user.id, reminder_id)
     if not row:
         await callback.answer("Напоминание не найдено", show_alert=True)
         return
 
     repeat_minutes = row["repeat_minutes"]
     if repeat_minutes:
-        ReminderService.reschedule_recurring(reminder_id, int(repeat_minutes))
+        await asyncio.to_thread(ReminderService.reschedule_recurring, reminder_id, int(repeat_minutes))
     else:
-        ReminderService.mark_done(callback.from_user.id, reminder_id)
+        await asyncio.to_thread(ReminderService.mark_done, callback.from_user.id, reminder_id)
     await ReminderService.clear_notification_messages(callback.bot, callback.from_user.id, reminder_id)
 
     await show_reminders_page(callback, callback.from_user.id, page, edit=True)
@@ -329,7 +330,7 @@ async def reminder_delete_callback(callback: CallbackQuery):
     parts = callback.data.split("_")
     reminder_id = int(parts[2])
     page = int(parts[3])
-    ReminderService.delete_reminder(callback.from_user.id, reminder_id)
+    await asyncio.to_thread(ReminderService.delete_reminder, callback.from_user.id, reminder_id)
     await ReminderService.clear_notification_messages(callback.bot, callback.from_user.id, reminder_id)
     await show_reminders_page(callback, callback.from_user.id, page, edit=True)
 
@@ -348,6 +349,6 @@ async def reminder_snooze_callback(callback: CallbackQuery):
     reminder_id = int(parts[2])
     page = int(parts[3])
     minutes = int(parts[4])
-    ReminderService.snooze_reminder(callback.from_user.id, reminder_id, minutes)
+    await asyncio.to_thread(ReminderService.snooze_reminder, callback.from_user.id, reminder_id, minutes)
     await ReminderService.clear_notification_messages(callback.bot, callback.from_user.id, reminder_id)
     await show_reminders_page(callback, callback.from_user.id, page, edit=True)

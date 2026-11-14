@@ -632,6 +632,16 @@ class MiniAppService:
             raise web.HTTPNotFound(text="Фото не найдено.")
 
         try:
+            file_id = str(media_group[index]["telegram_file_id"])
+            etag = '"' + hashlib.sha256(file_id.encode("utf-8")).hexdigest() + '"'
+            cache_headers = {
+                "Cache-Control": "private, max-age=300, must-revalidate",
+                "ETag": etag,
+                "Vary": "X-Telegram-Init-Data",
+                "X-Content-Type-Options": "nosniff",
+            }
+            if request.headers.get("If-None-Match") == etag:
+                return web.Response(status=304, headers=cache_headers)
             telegram_file = await self.bot.get_file(media_group[index]["telegram_file_id"])
             if not telegram_file.file_path:
                 raise RuntimeError("Telegram returned no file path")
@@ -644,8 +654,7 @@ class MiniAppService:
                         status=200,
                         headers={
                             "Content-Type": upstream.headers.get("Content-Type", "image/jpeg"),
-                            "Cache-Control": "no-store",
-                            "X-Content-Type-Options": "nosniff",
+                            **cache_headers,
                         },
                     )
                     await response.prepare(request)
