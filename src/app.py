@@ -127,6 +127,21 @@ SKIP_TAG_WORDS = {"пропустить", "skip", "нет", "-", "пусто", "
 PAGE_SIZE = 10
 
 
+def _store_pending_media_group_part(message: Message) -> None:
+    conn = get_connection()
+    try:
+        conn.execute(
+            """INSERT OR IGNORE INTO pending_media_group_parts
+               (chat_id, media_group_id, message_id, user_id, message_json)
+               VALUES (?, ?, ?, ?, ?)""",
+            (message.chat.id, str(message.media_group_id), message.message_id,
+             message.from_user.id, message.model_dump_json(exclude_none=True)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 
 class SearchStates(StatesGroup):
     waiting_for_query = State()
@@ -2925,6 +2940,7 @@ async def _delete_archived_item(user_id: int, item_id: int) -> tuple[bool, bool]
 
     chat_id = int(item["archive_chat_id"] or user_id)
     archive_removed = False
+    archive_delete_failed = False
     archive_message_id = item["archive_message_id"]
     context_message_id = item["context_message_id"]
     try:
@@ -2942,12 +2958,18 @@ async def _delete_archived_item(user_id: int, item_id: int) -> tuple[bool, bool]
             if message_id in archive_message_ids:
                 archive_removed = True
         except Exception:
+            archive_delete_failed = True
             logging.info(
                 "Could not delete Telegram archive message %s for item %s",
                 message_id,
                 item_id,
                 exc_info=True,
             )
+
+    if archive_delete_failed:
+        # Keep the catalog row so the user can retry the Telegram copy deletion;
+        # otherwise the archive message would become an unreachable orphan.
+        return False, False
 
     VaultService.delete_item(user_id, item_id)
 
@@ -2968,14 +2990,20 @@ async def delete_item_folder_callback(callback: CallbackQuery):
     page = int(parts[5])
     item_id = int(parts[6])
 
-    await _delete_archived_item(callback.from_user.id, item_id)
+    deleted, _ = await _delete_archived_item(callback.from_user.id, item_id)
+    if not deleted:
+        await callback.answer("Не удалось удалить копию из чата бота; материал оставлен в архиве для повтора", show_alert=True)
     await show_folder_items_page(callback, callback.from_user.id, folder_id, folders_page, page, edit=True)
 
 
 @dp.callback_query(F.data.startswith("review_delete_"))
 async def review_delete_item_callback(callback: CallbackQuery):
     item_id = int(callback.data.rsplit("_", 1)[1])
-    _, archive_removed = await _delete_archived_item(callback.from_user.id, item_id)
+    deleted, archive_removed = await _delete_archived_item(callback.from_user.id, item_id)
+    if not deleted:
+        await callback.answer("Копию не удалось удалить. Материал сохранён, попробуй ещё раз.", show_alert=True)
+        await show_next_inbox_item(callback, callback.from_user.id)
+        return
     await callback.answer("Материал и копия удалены" if archive_removed else "Запись удалена из каталога")
     await show_next_inbox_item(callback, callback.from_user.id, skip_item_id=item_id)
 
@@ -2986,7 +3014,9 @@ async def delete_item_all_callback(callback: CallbackQuery):
     page = int(parts[3])
     item_id = int(parts[4])
 
-    await _delete_archived_item(callback.from_user.id, item_id)
+    deleted, _ = await _delete_archived_item(callback.from_user.id, item_id)
+    if not deleted:
+        await callback.answer("Не удалось удалить копию из чата бота; материал оставлен в архиве для повтора", show_alert=True)
     await show_all_files_page(callback, callback.from_user.id, page, edit=True)
 
 
@@ -2997,7 +3027,9 @@ async def delete_item_search_callback(callback: CallbackQuery):
     page = int(parts[4])
     item_id = int(parts[5])
 
-    await _delete_archived_item(callback.from_user.id, item_id)
+    deleted, _ = await _delete_archived_item(callback.from_user.id, item_id)
+    if not deleted:
+        await callback.answer("Не удалось удалить копию из чата бота; материал оставлен в архиве для повтора", show_alert=True)
     await show_search_results_page(callback, session_id, page, edit=True)
 
 
@@ -3289,6 +3321,10 @@ async def capture_incoming_message(message: Message, state: FSMContext):
         return
     if message.media_group_id:
         key = (message.chat.id, str(message.media_group_id))
+        # Persist each part so a Render restart during the album quiet window
+        # does not silently lose the whole group. The DB row is removed after
+        # a successful/intentional flush; INSERT OR IGNORE makes redelivery safe.
+        await asyncio.to_thread(_store_pending_media_group_part, message)
         media_group_messages.setdefault(key, []).append(message)
         media_group_states[key] = state
         previous = media_group_tasks.get(key)
@@ -3319,21 +3355,72 @@ async def _flush_media_group(key: tuple[int, str]) -> None:
             messages = sorted(media_group_messages.pop(key, []), key=lambda message: message.message_id)
             state = media_group_states.pop(key, None)
             media_group_tasks.pop(key, None)
-            if not messages or state is None:
+            if not messages:
                 return
             await _capture_media_group_locked(messages, state)
+            await asyncio.to_thread(_clear_pending_media_group, key)
     except asyncio.CancelledError:
         return
     except Exception:
         logging.exception("Could not collect Telegram media group %s", key[1])
+        # Keep the durable parts and retry in-process as well as after restart.
+        async def retry_pending_album():
+            await asyncio.sleep(5)
+            await _restore_pending_media_groups()
+        asyncio.create_task(retry_pending_album())
 
 
-async def _capture_media_group_locked(messages: list[Message], state: FSMContext) -> None:
+def _clear_pending_media_group(key: tuple[int, str]) -> None:
+    conn = get_connection()
+    try:
+        conn.execute(
+            "DELETE FROM pending_media_group_parts WHERE chat_id = ? AND media_group_id = ?",
+            key,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+async def _restore_pending_media_groups() -> None:
+    def load_pending():
+        conn = get_connection()
+        try:
+            rows = conn.execute(
+                """SELECT chat_id, media_group_id, message_id, message_json
+                   FROM pending_media_group_parts
+                   WHERE created_at >= datetime('now', '-1 day')
+                   ORDER BY chat_id, media_group_id, message_id"""
+            ).fetchall()
+            conn.execute("DELETE FROM pending_media_group_parts WHERE created_at < datetime('now', '-1 day')")
+            conn.commit()
+            return rows
+        finally:
+            conn.close()
+    rows = await asyncio.to_thread(load_pending)
+    for row in rows:
+        key = (int(row["chat_id"]), str(row["media_group_id"]))
+        try:
+            restored = Message.model_validate_json(str(row["message_json"]))
+        except Exception:
+            logging.warning("Could not restore pending album part chat_id=%s message_id=%s", key[0], row["message_id"], exc_info=True)
+            continue
+        existing = media_group_messages.setdefault(key, [])
+        if all(message.message_id != restored.message_id for message in existing):
+            existing.append(restored)
+    for key, messages in list(media_group_messages.items()):
+        if media_group_tasks.get(key) and not media_group_tasks[key].done():
+            continue
+        media_group_messages[key] = sorted(messages, key=lambda message: message.message_id)
+        media_group_tasks[key] = asyncio.create_task(_flush_media_group(key))
+
+
+async def _capture_media_group_locked(messages: list[Message], state: FSMContext | None) -> None:
     first = messages[0]
     if (
         not first.from_user
         or first.chat.type != "private"
-        or await state.get_state() is not None
+        or (state is not None and await state.get_state() is not None)
         or (first.text or "").lstrip().startswith("/")
     ):
         return
@@ -3630,6 +3717,7 @@ async def go_home_handler(callback: CallbackQuery, state: FSMContext):
 async def main():
     global health_server
     init_db()
+    await _restore_pending_media_groups()
     secretary_service = SecretaryService(settings) if settings.secretary_bot_token else None
 
     try:
