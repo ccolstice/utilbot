@@ -166,6 +166,8 @@ class SecretaryService:
         self.ai_album_pending: dict[tuple[str, int, str], list[dict[str, Any]]] = {}
         self.ai_album_tasks: dict[tuple[str, int, str], asyncio.Task] = {}
         self.recent_snapshots: OrderedDict[tuple[str, int, int], dict[str, Any]] = OrderedDict()
+        self.background_tasks: set[asyncio.Task] = set()
+        self.last_history_cleanup = 0.0
 
     async def _api(self, method: str, data: dict[str, Any] | None = None, *, timeout: int = 40):
         if self.session is None:
@@ -285,14 +287,7 @@ class SecretaryService:
     async def _load_startup_state(self):
         def load(conn):
             conn.execute("DELETE FROM secretary_jobs WHERE status='done' AND created_at<?", (time.time() - 30 * 86400,))
-            conn.execute(
-                "DELETE FROM secretary_message_snapshots WHERE rowid IN (SELECT rowid FROM secretary_message_snapshots WHERE updated_at<? LIMIT 5000)",
-                (time.time() - 90 * 86400,),
-            )
-            conn.execute(
-                "DELETE FROM secretary_message_events WHERE id IN (SELECT id FROM secretary_message_events WHERE created_at<? LIMIT 5000)",
-                (time.time() - 365 * 86400,),
-            )
+            self._prune_history_conn(conn)
             jobs = conn.execute(
                 "SELECT * FROM secretary_jobs WHERE status='active' ORDER BY next_at"
             ).fetchall()
@@ -302,10 +297,32 @@ class SecretaryService:
             return [_row_to_dict(row) for row in jobs], int(meta["value"]) + 1 if meta else None
 
         jobs, offset = await self._db(load)
+        self.last_history_cleanup = time.time()
         for job in jobs:
             if job["kind"] == "mute" and job.get("expires_at"):
                 self.active_mutes[(job["business_connection_id"], int(job["chat_id"]))] = float(job["expires_at"])
         return jobs, offset
+
+    @staticmethod
+    def _prune_history_conn(conn):
+        conn.execute(
+            "DELETE FROM secretary_message_snapshots WHERE rowid IN (SELECT rowid FROM secretary_message_snapshots WHERE updated_at<? LIMIT 5000)",
+            (time.time() - 90 * 86400,),
+        )
+        conn.execute(
+            "DELETE FROM secretary_message_events WHERE id IN (SELECT id FROM secretary_message_events WHERE created_at<? LIMIT 5000)",
+            (time.time() - 365 * 86400,),
+        )
+
+    async def _prune_history(self):
+        await self._db(self._prune_history_conn)
+        self.last_history_cleanup = time.time()
+
+    def _spawn_background(self, coroutine, *, name: str):
+        task = asyncio.create_task(coroutine, name=name)
+        self.background_tasks.add(task)
+        task.add_done_callback(self.background_tasks.discard)
+        return task
 
     async def _save_offset(self, update_id: int):
         await self._db(lambda conn: conn.execute(
@@ -1124,7 +1141,10 @@ class SecretaryService:
                 self.recent_snapshots.move_to_end(cache_key)
                 while len(self.recent_snapshots) > 2000:
                     self.recent_snapshots.popitem(last=False)
-                asyncio.create_task(self._save_message_snapshot_safely(message, ignore_delete=True))
+                self._spawn_background(
+                    self._save_message_snapshot_safely(message, ignore_delete=True),
+                    name=f"mute-snapshot-{chat_id}-{message.get('message_id')}",
+                )
                 try:
                     await self._api("deleteBusinessMessages", {
                         "business_connection_id": connection_id, "message_ids": [int(message["message_id"])],
@@ -1668,6 +1688,8 @@ class SecretaryService:
             self.scheduler_task = asyncio.create_task(self._scheduler(), name="secretary-scheduler")
         while True:
             try:
+                if time.time() - self.last_history_cleanup >= 24 * 60 * 60:
+                    await self._prune_history()
                 params: dict[str, Any] = {"timeout": 25, "allowed_updates": [
                     "message", "callback_query", "business_connection", "business_message", "edited_business_message",
                     "deleted_business_messages",
