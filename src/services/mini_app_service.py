@@ -395,33 +395,74 @@ class MiniAppService:
                             FROM vault_items i JOIN vault_folders f ON f.id = i.folder_id
                             WHERE {where} ORDER BY i.id DESC"""
                 if turso_backend:
-                    rows = conn.execute(select_sql, params).fetchall()
-                    if source_type:
-                        source_needle = source_value.casefold()
-                        if source_type == "own":
-                            telegram_user = request.get("telegram_user", {})
-                            own_username = str(telegram_user.get("username") or source_value).casefold()
-                            own_name = " ".join(filter(None, [telegram_user.get("first_name"), telegram_user.get("last_name")])).casefold()
-                            rows = [row for row in rows if str(row["sender_username"] or "").casefold() == own_username or str(row["sender_name"] or "").casefold() == own_name]
-                        else:
-                            field = source_columns[source_type]
-                            rows = [row for row in rows if str(row[field] or "").casefold() == source_needle]
-                    if tag:
-                        tag_needle = tag.casefold().lstrip("#")
-                        rows = [row for row in rows if tag_needle in str(row["tag"] or "").casefold()]
-                    if query:
+                    # Turso cannot run Python's Unicode casefold (needed for
+                    # Cyrillic). For free-text filters scan only a narrow,
+                    # bounded projection in chunks; fetch full media metadata
+                    # only for the requested page. Ordinary archive browsing
+                    # uses SQL pagination directly.
+                    needs_python_filter = bool(query or tag or source_type)
+                    if not needs_python_filter:
+                        total = int(conn.execute(
+                            f"SELECT COUNT(*) AS n FROM vault_items i JOIN vault_folders f ON f.id = i.folder_id WHERE {where}",
+                            params,
+                        ).fetchone()["n"])
+                        rows = conn.execute(
+                            select_sql + " LIMIT ? OFFSET ?",
+                            [*params, page_size, (page - 1) * page_size],
+                        ).fetchall()
+                    else:
+                        lightweight_sql = f"""SELECT i.id, i.kind, i.content, i.context_text, i.ocr_text,
+                            i.tag, i.file_name, i.sender_name, i.sender_username,
+                            i.source_chat_title, i.link_domain, i.link_url, i.page_title,
+                            f.name AS folder_name
+                            FROM vault_items i JOIN vault_folders f ON f.id = i.folder_id
+                            WHERE {where} ORDER BY i.id DESC LIMIT ? OFFSET ?"""
+                        offset = (page - 1) * page_size
+                        matched_count = 0
+                        selected_ids = []
+                        scan_offset = 0
+                        scan_size = 200
                         query_needle = query.casefold()
-                        search_fields = (
-                            "content", "context_text", "ocr_text", "tag", "file_name", "sender_name",
-                            "source_chat_title", "link_url", "page_title", "folder_name",
-                        )
-                        rows = [
-                            row for row in rows
-                            if any(query_needle in str(row[field] or "").casefold() for field in search_fields)
-                        ]
-                    total = len(rows)
-                    offset = (page - 1) * page_size
-                    rows = rows[offset:offset + page_size]
+                        tag_needle = tag.casefold().lstrip("#")
+                        telegram_user = request.get("telegram_user", {})
+                        own_username = str(telegram_user.get("username") or source_value).casefold()
+                        own_name = " ".join(filter(None, [telegram_user.get("first_name"), telegram_user.get("last_name")])).casefold()
+                        search_fields = ("content", "context_text", "ocr_text", "tag", "file_name", "sender_name",
+                                         "source_chat_title", "link_url", "page_title", "folder_name")
+                        while True:
+                            batch_rows = conn.execute(lightweight_sql, [*params, scan_size, scan_offset]).fetchall()
+                            if not batch_rows:
+                                break
+                            for candidate in batch_rows:
+                                if source_type:
+                                    if source_type == "own":
+                                        source_match = (
+                                            str(candidate["sender_username"] or "").casefold() == own_username
+                                            or str(candidate["sender_name"] or "").casefold() == own_name
+                                        )
+                                    else:
+                                        source_match = str(candidate[source_columns[source_type]] or "").casefold() == source_value.casefold()
+                                    if not source_match:
+                                        continue
+                                if tag and tag_needle not in str(candidate["tag"] or "").casefold():
+                                    continue
+                                if query and not any(query_needle in str(candidate[field] or "").casefold() for field in search_fields):
+                                    continue
+                                if matched_count >= offset and len(selected_ids) < page_size:
+                                    selected_ids.append(int(candidate["id"]))
+                                matched_count += 1
+                            scan_offset += len(batch_rows)
+                            if len(batch_rows) < scan_size:
+                                break
+                        total = matched_count
+                        if selected_ids:
+                            id_marks = ",".join("?" for _ in selected_ids)
+                            rows = conn.execute(
+                                select_sql.replace(f"WHERE {where}", f"WHERE {where} AND i.id IN ({id_marks})"),
+                                [*params, *selected_ids],
+                            ).fetchall()
+                        else:
+                            rows = []
                 else:
                     total = int(conn.execute(
                         f"SELECT COUNT(*) AS n FROM vault_items i JOIN vault_folders f ON f.id = i.folder_id WHERE {where}",

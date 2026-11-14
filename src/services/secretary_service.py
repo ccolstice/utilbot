@@ -8,7 +8,9 @@ import random
 import re
 import threading
 import time
+import unicodedata
 import uuid
+from collections import OrderedDict
 from contextlib import suppress
 from typing import Any
 
@@ -63,6 +65,30 @@ TELEGRAM_TEXT_LIMIT = 4096
 
 def _telegram_text_units(text: str) -> int:
     return len(text.encode("utf-16-le")) // 2
+
+
+def _graphemes(text: str) -> list[str]:
+    """Small stdlib grapheme splitter for combining marks, emoji joins and flags."""
+    result: list[str] = []
+    regional_count = 0
+    for char in text:
+        codepoint = ord(char)
+        is_regional = 0x1F1E6 <= codepoint <= 0x1F1FF
+        attaches = bool(result) and (
+            unicodedata.category(char).startswith("M")
+            or 0xFE00 <= codepoint <= 0xFE0F
+            or 0xE0100 <= codepoint <= 0xE01EF
+            or 0x1F3FB <= codepoint <= 0x1F3FF
+            or char == "\u200d"
+            or result[-1].endswith("\u200d")
+            or (is_regional and regional_count % 2 == 1)
+        )
+        if attaches:
+            result[-1] += char
+        else:
+            result.append(char)
+        regional_count = regional_count + 1 if is_regional else 0
+    return result
 
 
 class TelegramApiError(RuntimeError):
@@ -137,6 +163,11 @@ class SecretaryService:
         self.ai_reply_tasks: set[asyncio.Task] = set()
         self.ai_reply_current: dict[tuple[str, int], asyncio.Task] = {}
         self.ai_reply_semaphore = asyncio.Semaphore(2)
+        self.ai_album_pending: dict[tuple[str, int, str], list[dict[str, Any]]] = {}
+        self.ai_album_tasks: dict[tuple[str, int, str], asyncio.Task] = {}
+        self.recent_snapshots: OrderedDict[tuple[str, int, int], dict[str, Any]] = OrderedDict()
+        self.background_tasks: set[asyncio.Task] = set()
+        self.last_history_cleanup = 0.0
 
     async def _api(self, method: str, data: dict[str, Any] | None = None, *, timeout: int = 40):
         if self.session is None:
@@ -256,6 +287,7 @@ class SecretaryService:
     async def _load_startup_state(self):
         def load(conn):
             conn.execute("DELETE FROM secretary_jobs WHERE status='done' AND created_at<?", (time.time() - 30 * 86400,))
+            self._prune_history_conn(conn)
             jobs = conn.execute(
                 "SELECT * FROM secretary_jobs WHERE status='active' ORDER BY next_at"
             ).fetchall()
@@ -265,10 +297,32 @@ class SecretaryService:
             return [_row_to_dict(row) for row in jobs], int(meta["value"]) + 1 if meta else None
 
         jobs, offset = await self._db(load)
+        self.last_history_cleanup = time.time()
         for job in jobs:
             if job["kind"] == "mute" and job.get("expires_at"):
                 self.active_mutes[(job["business_connection_id"], int(job["chat_id"]))] = float(job["expires_at"])
         return jobs, offset
+
+    @staticmethod
+    def _prune_history_conn(conn):
+        conn.execute(
+            "DELETE FROM secretary_message_snapshots WHERE rowid IN (SELECT rowid FROM secretary_message_snapshots WHERE updated_at<? LIMIT 5000)",
+            (time.time() - 90 * 86400,),
+        )
+        conn.execute(
+            "DELETE FROM secretary_message_events WHERE id IN (SELECT id FROM secretary_message_events WHERE created_at<? LIMIT 5000)",
+            (time.time() - 365 * 86400,),
+        )
+
+    async def _prune_history(self):
+        await self._db(self._prune_history_conn)
+        self.last_history_cleanup = time.time()
+
+    def _spawn_background(self, coroutine, *, name: str):
+        task = asyncio.create_task(coroutine, name=name)
+        self.background_tasks.add(task)
+        task.add_done_callback(self.background_tasks.discard)
+        return task
 
     async def _save_offset(self, update_id: int):
         await self._db(lambda conn: conn.execute(
@@ -558,6 +612,12 @@ class SecretaryService:
         if (not connection_id or chat.get("type") != "private" or not chat_id or not message_id
                 or not int(sender.get("id") or 0)):
             return
+        cache_key = (connection_id, chat_id, message_id)
+        self.recent_snapshots[cache_key] = {"message": message, "ignore_delete": ignore_delete,
+                                            "updated_at": time.time()}
+        self.recent_snapshots.move_to_end(cache_key)
+        while len(self.recent_snapshots) > 2000:
+            self.recent_snapshots.popitem(last=False)
         encoded = json.dumps(message, ensure_ascii=False, separators=(",", ":"))
         await self._db(lambda conn: conn.execute(
             "INSERT INTO secretary_message_snapshots "
@@ -568,6 +628,13 @@ class SecretaryService:
             (connection_id, chat_id, message_id, int(sender.get("id") or 0), self._sender_name(sender),
              encoded, int(ignore_delete), time.time()),
         ))
+
+    async def _save_message_snapshot_safely(self, message: dict[str, Any], *, ignore_delete: bool = False):
+        try:
+            await self._save_message_snapshot(message, ignore_delete=ignore_delete)
+        except Exception:
+            logger.exception("Secretary could not persist message snapshot chat_id=%s message_id=%s",
+                             (message.get("chat") or {}).get("id"), message.get("message_id"))
 
     async def _set_ai_mode(self, connection_id: str, chat_id: int, mode: str | None):
         key = (connection_id, int(chat_id))
@@ -598,7 +665,7 @@ class SecretaryService:
         rows = await self._db(lambda conn: conn.execute(
             "SELECT message_id, message_json FROM secretary_message_snapshots "
             "WHERE business_connection_id=? AND chat_id=? AND message_id<=? AND updated_at>=? "
-            "ORDER BY updated_at DESC LIMIT 12",
+            "ORDER BY message_id DESC LIMIT 12",
             (connection_id, int(chat_id), int(message_id), time.time() - 6 * 60 * 60),
         ).fetchall())
         lines = []
@@ -619,27 +686,65 @@ class SecretaryService:
             lines.append(f"{self._sender_name(sender)}: {text[:1200]}")
         return "\n".join(lines)[-9000:], trigger_message
 
-    async def _secretary_image(self, message: dict[str, Any] | None) -> tuple[str, str]:
-        photos = (message or {}).get("photo") or []
-        if not photos or not isinstance(photos[-1], dict) or not photos[-1].get("file_id"):
-            return "", ""
+    async def _secretary_images(self, messages: list[dict[str, Any]]) -> list[dict[str, str]]:
         if self.session is None:
             raise RuntimeError("Secretary Telegram session is not ready")
-        file_info = await self._api("getFile", {"file_id": photos[-1]["file_id"]})
-        if int(file_info.get("file_size") or 0) > 15 * 1024 * 1024:
-            raise ValueError("Фото больше 15 МБ и не передано в ИИ-режим.")
-        file_path = str(file_info.get("file_path") or "")
-        if not file_path:
-            return "", ""
-        async with self.session.get(f"https://api.telegram.org/file/bot{self.token}/{file_path}") as response:
-            if response.status != 200:
-                raise RuntimeError(f"Telegram не отдал фото (HTTP {response.status}).")
-            image = await response.read()
-        if not image or len(image) > 15 * 1024 * 1024:
-            raise ValueError("Фото больше 15 МБ и не передано в ИИ-режим.")
-        lowered = file_path.lower()
-        mime_type = "image/png" if lowered.endswith(".png") else "image/webp" if lowered.endswith(".webp") else "image/jpeg"
-        return base64.b64encode(image).decode("ascii"), mime_type
+        result: list[dict[str, str]] = []
+        total_bytes = 0
+        seen_file_ids: set[str] = set()
+        for message in messages:
+            photos = message.get("photo") or []
+            if not photos or not isinstance(photos[-1], dict) or not photos[-1].get("file_id"):
+                continue
+            file_id = str(photos[-1]["file_id"])
+            if file_id in seen_file_ids:
+                continue
+            seen_file_ids.add(file_id)
+            file_info = await self._api("getFile", {"file_id": file_id})
+            if int(file_info.get("file_size") or 0) > 15 * 1024 * 1024:
+                raise ValueError("Фото больше 15 МБ и не передано в ИИ-режим.")
+            file_path = str(file_info.get("file_path") or "")
+            if not file_path:
+                continue
+            async with self.session.get(f"https://api.telegram.org/file/bot{self.token}/{file_path}") as response:
+                if response.status != 200:
+                    raise RuntimeError(f"Telegram не отдал фото (HTTP {response.status}).")
+                image = await response.content.read(15 * 1024 * 1024 + 1)
+            total_bytes += len(image)
+            if not image or len(image) > 15 * 1024 * 1024 or total_bytes > 15 * 1024 * 1024:
+                raise ValueError("Общий размер изображений больше 15 МБ; альбом не передан в ИИ-режим.")
+            lowered = file_path.lower()
+            mime_type = "image/png" if lowered.endswith(".png") else "image/webp" if lowered.endswith(".webp") else "image/jpeg"
+            result.append({"image_base64": base64.b64encode(image).decode("ascii"), "mime_type": mime_type})
+            if len(result) >= 5:
+                break
+        return result
+
+    async def _queue_ai_album_piece(self, connection_id: str, chat_id: int,
+                                    message: dict[str, Any], mode: str):
+        media_group_id = str(message.get("media_group_id") or "")
+        key = (connection_id, int(chat_id), media_group_id)
+        self.ai_album_pending.setdefault(key, []).append(message)
+        previous = self.ai_album_tasks.get(key)
+        if previous and not previous.done():
+            previous.cancel()
+
+        async def flush():
+            try:
+                await asyncio.sleep(1.5)
+                messages = sorted(self.ai_album_pending.pop(key, []), key=lambda item: int(item.get("message_id") or 0))
+                if not messages:
+                    return
+                trigger = dict(messages[-1])
+                trigger["_secretary_album"] = messages[:5]
+                self._start_ai_reply(connection_id, chat_id, trigger, mode)
+            except asyncio.CancelledError:
+                return
+            finally:
+                if self.ai_album_tasks.get(key) is asyncio.current_task():
+                    self.ai_album_tasks.pop(key, None)
+
+        self.ai_album_tasks[key] = asyncio.create_task(flush())
 
     async def _queue_ai_reply(self, connection_id: str, chat_id: int, message: dict[str, Any], mode: str):
         async with self.ai_reply_semaphore:
@@ -671,10 +776,12 @@ class SecretaryService:
                 if not context:
                     return
                 started_at = time.perf_counter()
-                image_base64, mime_type = await self._secretary_image(trigger_message)
+                album_messages = message.get("_secretary_album")
+                image_sources = album_messages if isinstance(album_messages, list) else [trigger_message]
+                images = await self._secretary_images(image_sources)
                 reply = await ChatGptAiService.generate_secretary_reply(
                     self.settings, self.owner_id, mode, context,
-                    image_base64=image_base64, mime_type=mime_type,
+                    images=images,
                 )
                 elapsed_ms = int((time.perf_counter() - started_at) * 1000)
                 if self.ai_reply_current.get(key) is not task:
@@ -758,6 +865,9 @@ class SecretaryService:
 
     async def _consume_deleted_message(self, connection_id: str, chat: dict[str, Any], message_id: int):
         chat_id = int(chat.get("id") or 0)
+        cached = self.recent_snapshots.pop((connection_id, chat_id, int(message_id)), None)
+        if cached and cached.get("ignore_delete"):
+            return None
         event_key = f"delete:{connection_id}:{chat_id}:{message_id}"
         chat_title = self._chat_label({**chat, "chat_id": chat_id})
 
@@ -1019,12 +1129,22 @@ class SecretaryService:
         mute_key = (connection_id, chat_id)
         mute_expiry = self.active_mutes.get(mute_key)
         muted_contact_message = sender_id != self.owner_id and bool(mute_expiry and mute_expiry > time.time())
-        await self._save_message_snapshot(message, ignore_delete=muted_contact_message)
-
         # Deletion is handled from the in-memory timer map so no Turso round-trip
         # sits in front of the fastest path.
         if sender_id != self.owner_id and mute_expiry:
             if mute_expiry > time.time():
+                # Cache the suppression marker and persist it in the background;
+                # the Telegram delete request does not wait for Turso.
+                cache_key = (connection_id, chat_id, int(message.get("message_id") or 0))
+                self.recent_snapshots[cache_key] = {"message": message, "ignore_delete": True,
+                                                    "updated_at": time.time()}
+                self.recent_snapshots.move_to_end(cache_key)
+                while len(self.recent_snapshots) > 2000:
+                    self.recent_snapshots.popitem(last=False)
+                self._spawn_background(
+                    self._save_message_snapshot_safely(message, ignore_delete=True),
+                    name=f"mute-snapshot-{chat_id}-{message.get('message_id')}",
+                )
                 try:
                     await self._api("deleteBusinessMessages", {
                         "business_connection_id": connection_id, "message_ids": [int(message["message_id"])],
@@ -1033,6 +1153,8 @@ class SecretaryService:
                     logger.warning("Secretary mute delete failed chat_id=%s: %s", chat_id, error)
                 return
             self.active_mutes.pop(mute_key, None)
+
+        await self._save_message_snapshot(message, ignore_delete=muted_contact_message)
 
         asyncio.create_task(self._remember_chat_safely(connection_id, chat, message.get("date")))
         if sender_id == self.owner_id and not sender.get("is_bot"):
@@ -1055,7 +1177,10 @@ class SecretaryService:
             return
         mode = await self._get_ai_mode(connection_id, chat_id)
         if mode:
-            self._start_ai_reply(connection_id, chat_id, message, mode)
+            if message.get("media_group_id"):
+                await self._queue_ai_album_piece(connection_id, chat_id, message, mode)
+            else:
+                self._start_ai_reply(connection_id, chat_id, message, mode)
 
     async def _handle_group_message(self, message: dict[str, Any]):
         chat = message.get("chat") or {}
@@ -1279,11 +1404,11 @@ class SecretaryService:
 
             if command == "type":
                 text = args
-                first = text[:1]
+                first = (_graphemes(text) or [""])[0]
                 message_id = await self._edit_or_send(connection_id, chat_id, source, first)
                 if len(first) < len(text) and message_id:
                     await self._create_job("type", connection_id, chat_id, message_id=message_id,
-                        payload={"text": text, "cursor": len(first), "segment_start": 0},
+                        payload={"text": text, "cursor": 1, "segment_start": 0, "unit_version": 1},
                         next_at=now + TYPE_CHARACTER_INTERVAL)
                 if operator_chat_id:
                     await feedback("Текст передан в выбранный чат.")
@@ -1407,14 +1532,27 @@ class SecretaryService:
 
             if kind == "type":
                 text = str(payload.get("text") or "")
+                units = _graphemes(text)
                 cursor = int(payload.get("cursor") or 0)
-                if cursor >= len(text):
+                segment_start = int(payload.get("segment_start") or 0)
+                if int(payload.get("unit_version") or 0) != 1:
+                    # Older queued jobs stored Python code-point offsets.
+                    def to_unit_offset(codepoint_offset: int) -> int:
+                        consumed = 0
+                        for unit_index, unit in enumerate(units):
+                            if consumed + len(unit) > codepoint_offset:
+                                return unit_index
+                            consumed += len(unit)
+                        return len(units)
+                    cursor = to_unit_offset(cursor)
+                    segment_start = to_unit_offset(segment_start)
+                    payload["unit_version"] = 1
+                if cursor >= len(units):
                     await self._finish_job(job_id)
                     return
 
-                segment_start = int(payload.get("segment_start") or 0)
-                current_segment = text[segment_start:cursor]
-                next_character = text[cursor]
+                current_segment = "".join(units[segment_start:cursor])
+                next_character = units[cursor]
                 if _telegram_text_units(current_segment) + _telegram_text_units(next_character) > TELEGRAM_TEXT_LIMIT:
                     # Telegram limits each message to 4096 characters. Continue
                     # longer input in another message, still one character at a time.
@@ -1423,7 +1561,7 @@ class SecretaryService:
                 else:
                     try:
                         await self._edit_message(
-                            connection_id, chat_id, message_id, text[segment_start:cursor + 1]
+                            connection_id, chat_id, message_id, "".join(units[segment_start:cursor + 1])
                         )
                     except TelegramApiError as error:
                         # If Telegram applied an edit but its response was lost,
@@ -1432,7 +1570,7 @@ class SecretaryService:
                         if error.code != 400 or "message is not modified" not in str(error).lower():
                             raise
                 cursor += 1
-                if cursor >= len(text):
+                if cursor >= len(units):
                     await self._finish_job(job_id)
                 else:
                     payload["cursor"] = cursor
@@ -1550,6 +1688,8 @@ class SecretaryService:
             self.scheduler_task = asyncio.create_task(self._scheduler(), name="secretary-scheduler")
         while True:
             try:
+                if time.time() - self.last_history_cleanup >= 24 * 60 * 60:
+                    await self._prune_history()
                 params: dict[str, Any] = {"timeout": 25, "allowed_updates": [
                     "message", "callback_query", "business_connection", "business_message", "edited_business_message",
                     "deleted_business_messages",

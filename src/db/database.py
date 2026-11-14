@@ -362,6 +362,18 @@ def init_db():
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(user_id, name)
     );
+
+    CREATE TABLE IF NOT EXISTS pending_media_group_parts (
+        chat_id INTEGER NOT NULL,
+        media_group_id TEXT NOT NULL,
+        message_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        message_json TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY(chat_id, media_group_id, message_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_pending_media_group_created
+        ON pending_media_group_parts(created_at);
     """)
 
     _ensure_column(conn, "vault_folders", "archived_at TIMESTAMP DEFAULT NULL")

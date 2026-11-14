@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import html
 import re
 from dataclasses import dataclass
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urljoin, urlparse, urlunparse
 
 import aiohttp
+
+from src.utils.safe_http import PublicResolver, validate_public_http_url
 
 
 URL_RE = re.compile(r"https?://[^\s<>()\"']+", re.IGNORECASE)
@@ -62,16 +65,38 @@ class LinkService:
             return None
 
         try:
-            timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+            timeout = aiohttp.ClientTimeout(total=timeout_seconds, connect=timeout_seconds)
             headers = {"User-Agent": "tg-util-bot/1.0"}
-            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-                async with session.get(info.url, allow_redirects=True) as response:
-                    if response.status >= 400:
-                        return info
-                    content_type = response.headers.get("content-type", "")
-                    if "text/html" not in content_type.lower():
-                        return info
-                    body = await response.text(errors="ignore")
+            connector = aiohttp.TCPConnector(resolver=PublicResolver(), use_dns_cache=False)
+            current_url = info.url
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers, connector=connector) as session:
+                for redirect_count in range(6):
+                    validate_public_http_url(current_url)
+                    async with session.get(current_url, allow_redirects=False) as response:
+                        if response.status in {301, 302, 303, 307, 308}:
+                            location = response.headers.get("Location")
+                            if not location or redirect_count == 5:
+                                return info
+                            current_url = urljoin(current_url, location)
+                            continue
+                        if response.status >= 400:
+                            return info
+                        content_type = response.headers.get("content-type", "")
+                        if "text/html" not in content_type.lower():
+                            return info
+                        declared_size = response.content_length
+                        if declared_size is not None and declared_size > 200_000:
+                            return info
+                        body = (await response.content.read(200_001)).decode(
+                            response.charset or "utf-8", errors="ignore"
+                        )
+                        if len(body.encode("utf-8", errors="ignore")) > 200_000:
+                            body = body[:200_000]
+                        break
+                else:
+                    return info
+        except (ValueError, OSError, aiohttp.ClientError, asyncio.TimeoutError):
+            return info
         except Exception:
             return info
 

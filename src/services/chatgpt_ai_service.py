@@ -27,12 +27,16 @@ def _image_mime(data: bytes, declared_type: str = "") -> str:
 class ChatGptAiService:
     @staticmethod
     async def generate_secretary_reply(settings: Settings, user_id: int, mode: str, context: str,
-                                       *, image_base64: str = "", mime_type: str = "") -> str:
+                                       *, image_base64: str = "", mime_type: str = "",
+                                       images: list[dict[str, str]] | None = None) -> str:
         if mode not in {"bydlo", "troll", "office", "reshala"}:
             raise ValueError("Неизвестный режим ИИ-секретаря.")
         if not settings.chatgpt_ai_url or not settings.chatgpt_ai_token:
             raise RuntimeError("Связь секретаря с SIWC не настроена.")
         timeout = aiohttp.ClientTimeout(total=210, connect=15)
+        image_payload = list(images or [])
+        if not image_payload and image_base64:
+            image_payload = [{"image_base64": image_base64, "mime_type": mime_type}]
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(
                 settings.chatgpt_ai_url,
@@ -41,8 +45,7 @@ class ChatGptAiService:
                     "user_id": user_id,
                     "record": {
                         "content": context[:9_000],
-                        "image_base64": image_base64,
-                        "mime_type": mime_type,
+                        "images": image_payload,
                     },
                     "mode": f"secretary_{mode}",
                 },

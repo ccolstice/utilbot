@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import xml.etree.ElementTree as ET
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import aiohttp
+from src.utils.safe_http import PublicResolver, validate_public_http_url
 
 from src.db.database import get_connection
 
@@ -52,12 +53,29 @@ class RSSService:
     @staticmethod
     async def fetch(url: str) -> tuple[str, list[dict[str, str]]]:
         timeout = aiohttp.ClientTimeout(total=12, connect=6)
-        async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": "TelegramUtilityBot/1.0"}) as session:
-            async with session.get(url, allow_redirects=True) as response:
-                response.raise_for_status()
-                if response.content_length and response.content_length > 2_000_000:
-                    raise ValueError("RSS feed is larger than 2 MB")
-                return parse_feed(await response.read(), url)
+        connector = aiohttp.TCPConnector(resolver=PublicResolver(), use_dns_cache=False)
+        current_url = url
+        async with aiohttp.ClientSession(timeout=timeout, headers={"User-Agent": "TelegramUtilityBot/1.0"},
+                                         connector=connector) as session:
+            for redirect_count in range(6):
+                validate_public_http_url(current_url)
+                async with session.get(current_url, allow_redirects=False) as response:
+                    if response.status in {301, 302, 303, 307, 308}:
+                        location = response.headers.get("Location")
+                        if not location or redirect_count == 5:
+                            raise ValueError("RSS feed redirected too many times or without a target")
+                        current_url = urljoin(current_url, location)
+                        continue
+                    response.raise_for_status()
+                    if response.content_length and response.content_length > 2_000_000:
+                        raise ValueError("RSS feed is larger than 2 MB")
+                    chunks = bytearray()
+                    async for chunk in response.content.iter_chunked(64 * 1024):
+                        if len(chunks) + len(chunk) > 2_000_000:
+                            raise ValueError("RSS feed is larger than 2 MB")
+                        chunks.extend(chunk)
+                    return parse_feed(bytes(chunks), current_url)
+        raise ValueError("Could not retrieve RSS feed")
 
     @staticmethod
     def add(user_id: int, url: str, title: str, latest_guid: str | None):
