@@ -1927,8 +1927,8 @@ async def help_handler(message: Message):
 @dp.message(Command("status"))
 async def status_command_handler(message: Message):
     health = health_server is not None
-    last_backup = BackupService.last_backup_at() or "ещё не создавалась"
-    item_count = VaultService.count_items(message.from_user.id)
+    last_backup = (await asyncio.to_thread(BackupService.last_backup_at)) or "ещё не создавалась"
+    item_count = await asyncio.to_thread(VaultService.count_items, message.from_user.id)
     text = (
         "📊 Статус бота\n\n"
         f"• Health server: {'on' if health else 'off'}\n"
@@ -1957,7 +1957,7 @@ async def backup_command_handler(message: Message):
     path = await BackupService.send_backup(bot, backup_recipients)
     if path:
         await render_menu_panel(message, f"✅ Резервная копия отправлена: {path.name}\n\nФайл выше оставь в чате — он нужен для восстановления.", reply_markup=main_menu_keyboard())
-    elif not BackupService.has_user_data():
+    elif not await asyncio.to_thread(BackupService.has_user_data):
         await render_menu_panel(message, "⚠️ База пустая, поэтому пустую резервную копию не отправляю. Если Render потерял каталог, ответь /restore на предыдущую копию.", reply_markup=main_menu_keyboard())
     else:
         await render_menu_panel(message, "❌ Не удалось отправить снимок. Проверь доступ бота к чату и повтори /backup.", reply_markup=main_menu_keyboard())
@@ -2011,9 +2011,9 @@ async def restore_command_handler(message: Message):
 
 
 async def _upload_drive_database_snapshot() -> dict:
-    if not BackupService.has_user_data():
+    if not await asyncio.to_thread(BackupService.has_user_data):
         raise RuntimeError("Текущая база пустая — пустой снимок не загружаю.")
-    path = BackupService.create_snapshot(prefix="utilbot-db")
+    path = await asyncio.to_thread(BackupService.create_snapshot, prefix="utilbot-db")
     try:
         count_db = sqlite3.connect(str(path))
         try:
@@ -2109,7 +2109,7 @@ async def drive_restore_confirm_handler(callback: CallbackQuery):
     restore_path = restore_dir / f"gdrive-restore-{uuid.uuid4().hex}.sqlite3"
     await callback.answer("Восстанавливаю базу…")
     try:
-        if BackupService.has_user_data():
+        if await asyncio.to_thread(BackupService.has_user_data):
             safety = await _upload_drive_database_snapshot()
             logging.info("Saved pre-restore Google Drive snapshot %s", safety.get("id"))
         await GoogleDriveService.download_snapshot(file_id, restore_path)

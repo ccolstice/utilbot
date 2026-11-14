@@ -189,7 +189,8 @@ class ReminderService:
                 completed_at = ?,
                 next_retry_at = NULL,
                 last_notified_at = NULL,
-                retry_count = 0
+                retry_count = 0,
+                delivery_failures = 0
             WHERE user_id = ? AND id = ?
             """,
             (_now_str(), user_id, reminder_id),
@@ -231,7 +232,8 @@ class ReminderService:
                 completed_at = NULL,
                 next_retry_at = NULL,
                 last_notified_at = NULL,
-                retry_count = 0
+                retry_count = 0,
+                delivery_failures = 0
             WHERE user_id = ? AND id = ?
             """,
             (new_due.replace(microsecond=0).isoformat(sep=" "), user_id, reminder_id),
@@ -259,7 +261,8 @@ class ReminderService:
                 completed_at = NULL,
                 next_retry_at = NULL,
                 last_notified_at = NULL,
-                retry_count = 0
+                retry_count = 0,
+                delivery_failures = 0
             WHERE user_id = ? AND id = ?
             """,
             (due_at.replace(microsecond=0).isoformat(sep=" "), user_id, reminder_id),
@@ -294,6 +297,28 @@ class ReminderService:
         ).fetchall()
         conn.close()
         return rows
+
+    @staticmethod
+    def defer_delivery(user_id: int, reminder_id: int):
+        conn = get_connection()
+        try:
+            now = datetime.utcnow()
+            row = conn.execute(
+                "SELECT delivery_failures FROM reminders WHERE user_id = ? AND id = ? AND status = 'pending'",
+                (user_id, reminder_id),
+            ).fetchone()
+            if not row:
+                return
+            failures = int(row["delivery_failures"] or 0) + 1
+            delay_minutes = min(6 * 60, 2 ** min(failures, 8))
+            conn.execute(
+                """UPDATE reminders SET delivery_failures = ?, next_retry_at = ?
+                   WHERE user_id = ? AND id = ? AND status = 'pending'""",
+                (failures, (now + timedelta(minutes=delay_minutes)).isoformat(sep=" "), user_id, reminder_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
     @staticmethod
     def reschedule_recurring(reminder_id: int, repeat_minutes: int):
@@ -361,7 +386,8 @@ class ReminderService:
             UPDATE reminders
             SET last_notified_at = ?,
                 next_retry_at = ?,
-                retry_count = COALESCE(retry_count, 0) + 1
+                retry_count = COALESCE(retry_count, 0) + 1,
+                delivery_failures = 0
             WHERE user_id = ? AND id = ? AND status = 'pending'
               AND due_at <= ? AND (next_retry_at IS NULL OR next_retry_at <= ?)
             """,
@@ -375,7 +401,6 @@ class ReminderService:
             ),
         )
         if cursor.rowcount:
-            conn.execute("DELETE FROM reminder_notifications WHERE user_id = ? AND reminder_id = ?", (user_id, reminder_id))
             conn.execute(
                 "INSERT OR IGNORE INTO reminder_notifications (reminder_id, user_id, chat_id, message_id) VALUES (?, ?, ?, ?)",
                 (reminder_id, user_id, chat_id, message_id),
@@ -390,29 +415,67 @@ class ReminderService:
 
     @staticmethod
     async def clear_notification_messages(bot, user_id: int, reminder_id: int):
-        conn = get_connection()
-        rows = conn.execute(
-            "SELECT chat_id, message_id FROM reminder_notifications WHERE user_id = ? AND reminder_id = ?",
-            (user_id, reminder_id),
-        ).fetchall()
-        conn.execute("DELETE FROM reminder_notifications WHERE user_id = ? AND reminder_id = ?", (user_id, reminder_id))
-        conn.commit()
-        conn.close()
-        for row in rows:
+        def load_rows():
+            conn = get_connection()
             try:
-                await bot.delete_message(int(row["chat_id"]), int(row["message_id"]))
-            except Exception:
-                logger.debug("Could not remove old reminder message %s/%s", row["chat_id"], row["message_id"], exc_info=True)
+                return conn.execute(
+                    "SELECT chat_id, message_id FROM reminder_notifications WHERE user_id = ? AND reminder_id = ?",
+                    (user_id, reminder_id),
+                ).fetchall()
+            finally:
+                conn.close()
+
+        def remove_tracking(chat_id: int, message_id: int):
+            conn = get_connection()
+            try:
+                conn.execute(
+                    "DELETE FROM reminder_notifications WHERE user_id = ? AND reminder_id = ? AND chat_id = ? AND message_id = ?",
+                    (user_id, reminder_id, chat_id, message_id),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+        rows = await asyncio.to_thread(load_rows)
+        for row in rows:
+            chat_id, message_id = int(row["chat_id"]), int(row["message_id"])
+            try:
+                await bot.delete_message(chat_id, message_id)
+            except Exception as error:
+                if "message to delete not found" not in str(error).lower():
+                    logger.warning("Could not remove reminder message %s/%s; tracking retained", chat_id, message_id)
+                    continue
+            await asyncio.to_thread(remove_tracking, chat_id, message_id)
+
+    @staticmethod
+    async def forget_notification(user_id: int, reminder_id: int, chat_id: int, message_id: int):
+        def remove():
+            conn = get_connection()
+            try:
+                conn.execute(
+                    "DELETE FROM reminder_notifications WHERE user_id = ? AND reminder_id = ? AND chat_id = ? AND message_id = ?",
+                    (user_id, reminder_id, chat_id, message_id),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        await asyncio.to_thread(remove)
 
 
 async def reminder_worker(bot, interval_seconds: int = 30):
     while True:
         try:
-            due = ReminderService.due_reminders()
-            for row in due:
-                reminder_id = int(row["id"])
+            due = await asyncio.to_thread(ReminderService.due_reminders)
+        except Exception:
+            logger.exception("Reminder worker could not load due reminders")
+            await asyncio.sleep(interval_seconds)
+            continue
+        for row in due:
+            reminder_id = int(row["id"])
+            user_id = row["user_id"]
+            sent = None
+            try:
                 title = normalize_multiline_input(row["title"]).strip()
-                user_id = row["user_id"]
                 retry_count = int(row["retry_count"] or 0)
 
                 extra = "Если не нажмёшь кнопку, я повторю это через 5 минут."
@@ -425,7 +488,7 @@ async def reminder_worker(bot, interval_seconds: int = 30):
                     reply_markup=reminder_notification_keyboard(reminder_id, row["source_item_id"]),
                 )
 
-                previous_messages = ReminderService.register_notification(
+                previous_messages = await asyncio.to_thread(ReminderService.register_notification,
                     user_id,
                     reminder_id,
                     int(sent.chat.id),
@@ -442,8 +505,22 @@ async def reminder_worker(bot, interval_seconds: int = 30):
                         try:
                             await bot.delete_message(int(previous["chat_id"]), int(previous["message_id"]))
                         except Exception:
-                            logger.debug("Could not replace old reminder message %s", previous["message_id"], exc_info=True)
-        except Exception:
-            logger.exception("Reminder worker failed")
+                            logger.warning("Could not replace old reminder message %s; tracking retained", previous["message_id"])
+                            continue
+                        await ReminderService.forget_notification(
+                            user_id, reminder_id, int(previous["chat_id"]), int(previous["message_id"])
+                        )
+            except Exception:
+                logger.exception("Reminder delivery failed reminder_id=%s", reminder_id)
+                if sent is not None:
+                    try:
+                        await bot.delete_message(sent.chat.id, sent.message_id)
+                    except Exception:
+                        logger.warning("Could not remove untracked failed reminder message reminder_id=%s",
+                                       reminder_id)
+                try:
+                    await asyncio.to_thread(ReminderService.defer_delivery, user_id, reminder_id)
+                except Exception:
+                    logger.exception("Could not defer failed reminder reminder_id=%s", reminder_id)
 
         await asyncio.sleep(interval_seconds)

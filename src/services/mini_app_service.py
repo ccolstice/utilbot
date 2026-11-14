@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import asyncio
 import json
 import logging
 import mimetypes
@@ -23,6 +24,29 @@ from src.utils.filters import is_allowed_user, is_owner_user
 from src.services.chatgpt_ocr_service import ChatGptOcrService
 
 logger = logging.getLogger(__name__)
+
+_EGRESS_WINDOW_SECONDS = 300
+_egress_window_started = time.monotonic()
+_egress_stats = {"preview_requests": 0, "preview_bytes": 0, "media_requests": 0, "media_bytes": 0}
+
+
+def _record_miniapp_egress(kind: str, byte_count: int) -> None:
+    global _egress_window_started
+    request_key, bytes_key = (("preview_requests", "preview_bytes") if kind == "preview"
+                              else ("media_requests", "media_bytes"))
+    _egress_stats[request_key] += 1
+    _egress_stats[bytes_key] += max(0, int(byte_count))
+    now = time.monotonic()
+    elapsed = now - _egress_window_started
+    if elapsed >= _EGRESS_WINDOW_SECONDS:
+        logger.info(
+            "Mini App egress window_seconds=%s preview_requests=%s preview_bytes=%s media_requests=%s media_bytes=%s",
+            int(elapsed), _egress_stats["preview_requests"], _egress_stats["preview_bytes"],
+            _egress_stats["media_requests"], _egress_stats["media_bytes"],
+        )
+        for key in _egress_stats:
+            _egress_stats[key] = 0
+        _egress_window_started = now
 MINI_APP_DIR = Path(__file__).resolve().parents[2] / "miniapp"
 VALID_STATES = {"inbox", "later", "saved", "done"}
 VALID_KINDS = {
@@ -216,7 +240,7 @@ class MiniAppService:
 
     async def list_reminders(self, request: web.Request) -> web.Response:
         user_id = self._authenticated_user_id(request)
-        rows = ReminderService.list_reminders(user_id, include_done=False, limit=100)
+        rows = await asyncio.to_thread(ReminderService.list_reminders, user_id, include_done=False, limit=100)
         return web.json_response({"reminders": [dict(row) for row in rows]},
                                  headers={"Cache-Control": "no-store"})
 
@@ -252,7 +276,7 @@ class MiniAppService:
         }.get(item["kind"], "Материал")).strip()[:120]
         if not title:
             raise web.HTTPBadRequest(text="Напиши, о чём напомнить.")
-        reminder = ReminderService.create_reminder(
+        reminder = await asyncio.to_thread(ReminderService.create_reminder,
             user_id=user_id, title=title, due_at=due_at, source_item_id=item_id,
             note=f"Напоминание по материалу #{item_id}",
         )
@@ -262,19 +286,19 @@ class MiniAppService:
     async def complete_reminder(self, request: web.Request) -> web.Response:
         user_id = self._authenticated_user_id(request)
         reminder_id = int(request.match_info["reminder_id"])
-        reminder = ReminderService.get_reminder(user_id, reminder_id)
+        reminder = await asyncio.to_thread(ReminderService.get_reminder, user_id, reminder_id)
         if not reminder:
             raise web.HTTPNotFound(text="Напоминание не найдено.")
-        updated = ReminderService.mark_done(user_id, reminder_id)
+        updated = await asyncio.to_thread(ReminderService.mark_done, user_id, reminder_id)
         return web.json_response({"reminder": dict(updated)}, headers={"Cache-Control": "no-store"})
 
     async def snooze_reminder(self, request: web.Request) -> web.Response:
         user_id = self._authenticated_user_id(request)
         reminder_id = int(request.match_info["reminder_id"])
-        reminder = ReminderService.get_reminder(user_id, reminder_id)
+        reminder = await asyncio.to_thread(ReminderService.get_reminder, user_id, reminder_id)
         if not reminder:
             raise web.HTTPNotFound(text="Напоминание не найдено.")
-        updated = ReminderService.snooze_reminder(user_id, reminder_id, 60)
+        updated = await asyncio.to_thread(ReminderService.snooze_reminder, user_id, reminder_id, 60)
         return web.json_response({"reminder": dict(updated)}, headers={"Cache-Control": "no-store"})
 
     async def list_items(self, request: web.Request) -> web.Response:
@@ -632,6 +656,17 @@ class MiniAppService:
             raise web.HTTPNotFound(text="Фото не найдено.")
 
         try:
+            file_id = str(media_group[index]["telegram_file_id"])
+            etag = '"' + hashlib.sha256(file_id.encode("utf-8")).hexdigest() + '"'
+            cache_headers = {
+                "Cache-Control": "private, max-age=300, must-revalidate",
+                "ETag": etag,
+                "Vary": "X-Telegram-Init-Data",
+                "X-Content-Type-Options": "nosniff",
+            }
+            if request.headers.get("If-None-Match") == etag:
+                _record_miniapp_egress("preview", 0)
+                return web.Response(status=304, headers=cache_headers)
             telegram_file = await self.bot.get_file(media_group[index]["telegram_file_id"])
             if not telegram_file.file_path:
                 raise RuntimeError("Telegram returned no file path")
@@ -644,14 +679,16 @@ class MiniAppService:
                         status=200,
                         headers={
                             "Content-Type": upstream.headers.get("Content-Type", "image/jpeg"),
-                            "Cache-Control": "no-store",
-                            "X-Content-Type-Options": "nosniff",
+                            **cache_headers,
                         },
                     )
                     await response.prepare(request)
+                    transferred = 0
                     async for chunk in upstream.content.iter_chunked(64 * 1024):
                         await response.write(chunk)
+                        transferred += len(chunk)
                     await response.write_eof()
+                    _record_miniapp_egress("preview", transferred)
                     return response
         except web.HTTPException:
             raise
@@ -816,9 +853,12 @@ class MiniAppService:
                             headers[name] = upstream.headers[name]
                     response = web.StreamResponse(status=upstream.status, headers=headers)
                     await response.prepare(request)
+                    transferred = 0
                     async for chunk in upstream.content.iter_chunked(64 * 1024):
                         await response.write(chunk)
+                        transferred += len(chunk)
                     await response.write_eof()
+                    _record_miniapp_egress("media", transferred)
                     return response
         except web.HTTPException:
             raise

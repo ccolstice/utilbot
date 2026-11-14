@@ -6,6 +6,7 @@ import json
 import logging
 import random
 import re
+import threading
 import time
 import uuid
 from contextlib import suppress
@@ -18,6 +19,7 @@ from src.db.database import get_connection
 from src.services.chatgpt_ai_service import ChatGptAiService
 
 logger = logging.getLogger(__name__)
+_DB_LOCK = threading.Lock()
 
 FLIP_MAP = str.maketrans({
     **dict(zip("abcdefghijklmnopqrstuvwxyz", "ɐqɔpǝɟƃɥᴉɾʞןɯuodbɹsʇnʌʍxʎz")),
@@ -76,6 +78,11 @@ class SecretaryPollingConflict(RuntimeError):
 
 
 def _db(callable_):
+    with _DB_LOCK:
+        return _db_with_retries(callable_)
+
+
+def _db_with_retries(callable_):
     # A failed Turso interactive transaction is rolled back remotely. Retry
     # the complete database-only callback on a fresh connection so a transient
     # Hrana SQLITE_BUSY does not strand time-sensitive jobs such as .type.
@@ -128,6 +135,8 @@ class SecretaryService:
         self.ai_modes: dict[tuple[str, int], str | None] = {}
         self.ai_reply_locks: dict[tuple[str, int], asyncio.Lock] = {}
         self.ai_reply_tasks: set[asyncio.Task] = set()
+        self.ai_reply_current: dict[tuple[str, int], asyncio.Task] = {}
+        self.ai_reply_semaphore = asyncio.Semaphore(2)
 
     async def _api(self, method: str, data: dict[str, Any] | None = None, *, timeout: int = 40):
         if self.session is None:
@@ -265,6 +274,36 @@ class SecretaryService:
         await self._db(lambda conn: conn.execute(
             "INSERT INTO secretary_meta(key, value) VALUES('last_update_id', ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(update_id),)
+        ))
+
+    async def _record_update_failure(self, update: dict[str, Any], error: Exception) -> int:
+        update_id = int(update.get("update_id") or 0)
+        encoded = json.dumps(update, ensure_ascii=False, separators=(",", ":"))
+        message = str(error)[:1000]
+        def save(conn):
+            conn.execute(
+                """INSERT INTO secretary_update_failures(update_id, payload, error, attempts, dead_letter, updated_at)
+                   VALUES (?, ?, ?, 1, 0, ?)
+                   ON CONFLICT(update_id) DO UPDATE SET payload=excluded.payload, error=excluded.error,
+                     attempts=secretary_update_failures.attempts+1, updated_at=excluded.updated_at""",
+                (update_id, encoded, message, time.time()),
+            )
+            row = conn.execute(
+                "SELECT attempts FROM secretary_update_failures WHERE update_id=?", (update_id,)
+            ).fetchone()
+            conn.execute(
+                """DELETE FROM secretary_update_failures
+                   WHERE dead_letter=1 AND update_id NOT IN (
+                     SELECT update_id FROM secretary_update_failures
+                     WHERE dead_letter=1 ORDER BY updated_at DESC LIMIT 1000
+                   )"""
+            )
+            return int(row["attempts"] or 1)
+        return await self._db(save)
+
+    async def _clear_update_failure(self, update_id: int):
+        await self._db(lambda conn: conn.execute(
+            "DELETE FROM secretary_update_failures WHERE update_id=?", (update_id,)
         ))
 
     async def _list_chats(self):
@@ -557,10 +596,19 @@ class SecretaryService:
         return base64.b64encode(image).decode("ascii"), mime_type
 
     async def _queue_ai_reply(self, connection_id: str, chat_id: int, message: dict[str, Any], mode: str):
+        async with self.ai_reply_semaphore:
+            await self._queue_ai_reply_limited(connection_id, chat_id, message, mode)
+
+    async def _queue_ai_reply_limited(self, connection_id: str, chat_id: int, message: dict[str, Any], mode: str):
         message_id = int(message.get("message_id") or 0)
         key = (connection_id, int(chat_id))
+        task = asyncio.current_task()
+        if self.ai_reply_current.get(key) is not task:
+            return
         lock = self.ai_reply_locks.setdefault(key, asyncio.Lock())
         async with lock:
+            if self.ai_reply_current.get(key) is not task:
+                return
             if await self._get_ai_mode(connection_id, chat_id) != mode:
                 return
             try:
@@ -583,6 +631,8 @@ class SecretaryService:
                     image_base64=image_base64, mime_type=mime_type,
                 )
                 elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+                if self.ai_reply_current.get(key) is not task:
+                    return
                 if await self._get_ai_mode(connection_id, chat_id) != mode:
                     logger.info("Secretary AI reply discarded after mode changed chat_id=%s", chat_id)
                     return
@@ -596,9 +646,21 @@ class SecretaryService:
                 logger.exception("Secretary AI auto-reply failed chat_id=%s mode=%s", chat_id, mode)
 
     def _start_ai_reply(self, connection_id: str, chat_id: int, message: dict[str, Any], mode: str):
+        key = (connection_id, int(chat_id))
+        previous = self.ai_reply_current.get(key)
+        if previous is None and len(self.ai_reply_current) >= 8:
+            logger.warning("Secretary AI reply queue full; dropping newest trigger chat_id=%s", chat_id)
+            return
+        if previous and not previous.done():
+            previous.cancel()
         task = asyncio.create_task(self._queue_ai_reply(connection_id, chat_id, message, mode))
+        self.ai_reply_current[key] = task
         self.ai_reply_tasks.add(task)
-        task.add_done_callback(self.ai_reply_tasks.discard)
+        def cleanup(done_task):
+            self.ai_reply_tasks.discard(done_task)
+            if self.ai_reply_current.get(key) is done_task:
+                self.ai_reply_current.pop(key, None)
+        task.add_done_callback(cleanup)
 
     async def _save_edited_message(self, update_id: int, message: dict[str, Any]):
         connection_id = str(message.get("business_connection_id") or "")
@@ -1228,6 +1290,7 @@ class SecretaryService:
         connection_id = job["business_connection_id"]
         chat_id = int(job["chat_id"])
         message_id = int(job["message_id"] or 0)
+        payload = json.loads(job.get("payload") or "{}")
         try:
             if kind == "mute":
                 key = (connection_id, chat_id)
@@ -1255,7 +1318,6 @@ class SecretaryService:
                     await self._finish_job(job_id)
                 return
 
-            payload = json.loads(job.get("payload") or "{}")
             if kind == "spam":
                 remaining = int(payload.get("remaining") or 0)
                 if remaining <= 0:
@@ -1320,12 +1382,20 @@ class SecretaryService:
                     payload["index"] = index + 1
                     await self._update_job(job_id, payload=payload, next_at=time.time() + 0.45)
         except TelegramApiError as error:
+            attempts = int(payload.get("retry_attempts") or 0) + 1
+            payload["retry_attempts"] = attempts
+            if attempts >= 5:
+                logger.error("Secretary scheduled action exhausted retries kind=%s chat_id=%s code=%s",
+                             kind, chat_id, error.code)
+                if kind == "mute":
+                    self.active_mutes.pop((connection_id, chat_id), None)
+                await self._finish_job(job_id)
+                return
             if error.retry_after:
-                await self._update_job(job_id, next_at=time.time() + int(error.retry_after) + 1)
+                await self._update_job(job_id, payload=payload,
+                                       next_at=time.time() + min(3600, int(error.retry_after) + 1))
                 return
             if kind == "type" and isinstance(error.code, int) and error.code >= 500:
-                attempts = int(payload.get("retry_attempts") or 0) + 1
-                payload["retry_attempts"] = attempts
                 await self._update_job(job_id, payload=payload,
                                        next_at=time.time() + min(30, 2 ** min(attempts, 5)))
                 logger.warning("Retrying .type after Telegram server error chat_id=%s code=%s attempt=%s",
@@ -1337,15 +1407,34 @@ class SecretaryService:
             await self._finish_job(job_id)
         except Exception:
             logger.exception("Secretary scheduled action failed kind=%s chat_id=%s", kind, chat_id)
-            await self._update_job(job_id, next_at=time.time() + 10)
+            attempts = int(payload.get("retry_attempts") or 0) + 1
+            if attempts >= 5:
+                logger.error("Secretary scheduled action exhausted unexpected retries kind=%s chat_id=%s",
+                             kind, chat_id)
+                await self._finish_job(job_id)
+            else:
+                payload["retry_attempts"] = attempts
+                await self._update_job(job_id, payload=payload,
+                                       next_at=time.time() + min(15 * 60, 10 * (2 ** (attempts - 1))))
 
     async def _scheduler(self):
         while True:
             try:
                 self.scheduler_wakeup.clear()
-                next_due = await self._db(lambda conn: (conn.execute(
-                    "SELECT MIN(next_at) AS due FROM secretary_jobs WHERE status='active'"
-                ).fetchone() or {"due": None})["due"])
+                now = time.time()
+                schedule = await self._db(lambda conn: conn.execute(
+                    """WITH next_job AS (
+                         SELECT MIN(next_at) AS next_due FROM secretary_jobs WHERE status='active'
+                       ), due_jobs AS (
+                         SELECT * FROM secretary_jobs WHERE status='active' AND next_at<=?
+                         ORDER BY next_at LIMIT 20
+                       )
+                       SELECT next_job.next_due, due_jobs.*
+                       FROM next_job LEFT JOIN due_jobs ON 1=1
+                       ORDER BY due_jobs.next_at""",
+                    (now,),
+                ).fetchall())
+                next_due = schedule[0]["next_due"] if schedule else None
                 delay = 30 if next_due is None else max(0, min(30, float(next_due) - time.time()))
                 if delay > 0:
                     try:
@@ -1353,12 +1442,7 @@ class SecretaryService:
                         continue
                     except asyncio.TimeoutError:
                         pass
-                due = await self._db(lambda conn: [
-                    _row_to_dict(row) for row in conn.execute(
-                        "SELECT * FROM secretary_jobs WHERE status='active' AND next_at<=? ORDER BY next_at LIMIT 20",
-                        (time.time(),),
-                    ).fetchall()
-                ])
+                due = [_row_to_dict(row) for row in schedule if row["id"] is not None]
                 for job in due:
                     await self._run_job(job)
             except asyncio.CancelledError:
@@ -1403,10 +1487,22 @@ class SecretaryService:
                     update_id = int(update.get("update_id", 0))
                     try:
                         await self._handle_update(update)
+                        await self._clear_update_failure(update_id)
                     except asyncio.CancelledError:
                         raise
-                    except Exception:
+                    except Exception as error:
                         logger.exception("Secretary update handler failed update_id=%s", update_id)
+                        attempts = await self._record_update_failure(update, error)
+                        if attempts < 3:
+                            # Preserve offset so Telegram delivers this update again.
+                            await asyncio.sleep(min(2 * attempts, 5))
+                            break
+                        await self._db(lambda conn: conn.execute(
+                            "UPDATE secretary_update_failures SET dead_letter=1 WHERE update_id=?",
+                            (update_id,),
+                        ))
+                        logger.error("Secretary update moved to durable failure queue update_id=%s attempts=%s",
+                                     update_id, attempts)
                     await self._save_offset(update_id)
                     offset = update_id + 1
             except asyncio.CancelledError:
