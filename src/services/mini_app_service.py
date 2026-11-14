@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import asyncio
 import json
 import logging
 import mimetypes
@@ -239,7 +240,7 @@ class MiniAppService:
 
     async def list_reminders(self, request: web.Request) -> web.Response:
         user_id = self._authenticated_user_id(request)
-        rows = ReminderService.list_reminders(user_id, include_done=False, limit=100)
+        rows = await asyncio.to_thread(ReminderService.list_reminders, user_id, include_done=False, limit=100)
         return web.json_response({"reminders": [dict(row) for row in rows]},
                                  headers={"Cache-Control": "no-store"})
 
@@ -275,7 +276,7 @@ class MiniAppService:
         }.get(item["kind"], "Материал")).strip()[:120]
         if not title:
             raise web.HTTPBadRequest(text="Напиши, о чём напомнить.")
-        reminder = ReminderService.create_reminder(
+        reminder = await asyncio.to_thread(ReminderService.create_reminder,
             user_id=user_id, title=title, due_at=due_at, source_item_id=item_id,
             note=f"Напоминание по материалу #{item_id}",
         )
@@ -285,19 +286,19 @@ class MiniAppService:
     async def complete_reminder(self, request: web.Request) -> web.Response:
         user_id = self._authenticated_user_id(request)
         reminder_id = int(request.match_info["reminder_id"])
-        reminder = ReminderService.get_reminder(user_id, reminder_id)
+        reminder = await asyncio.to_thread(ReminderService.get_reminder, user_id, reminder_id)
         if not reminder:
             raise web.HTTPNotFound(text="Напоминание не найдено.")
-        updated = ReminderService.mark_done(user_id, reminder_id)
+        updated = await asyncio.to_thread(ReminderService.mark_done, user_id, reminder_id)
         return web.json_response({"reminder": dict(updated)}, headers={"Cache-Control": "no-store"})
 
     async def snooze_reminder(self, request: web.Request) -> web.Response:
         user_id = self._authenticated_user_id(request)
         reminder_id = int(request.match_info["reminder_id"])
-        reminder = ReminderService.get_reminder(user_id, reminder_id)
+        reminder = await asyncio.to_thread(ReminderService.get_reminder, user_id, reminder_id)
         if not reminder:
             raise web.HTTPNotFound(text="Напоминание не найдено.")
-        updated = ReminderService.snooze_reminder(user_id, reminder_id, 60)
+        updated = await asyncio.to_thread(ReminderService.snooze_reminder, user_id, reminder_id, 60)
         return web.json_response({"reminder": dict(updated)}, headers={"Cache-Control": "no-store"})
 
     async def list_items(self, request: web.Request) -> web.Response:
