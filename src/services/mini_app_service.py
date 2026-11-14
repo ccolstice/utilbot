@@ -88,6 +88,18 @@ class MiniAppService:
         self.bot = bot
         self.settings = settings
 
+    @staticmethod
+    def _run_db(callback):
+        """Run a complete synchronous DB callback outside the aiohttp event loop."""
+        conn = get_connection()
+        try:
+            return callback(conn)
+        finally:
+            conn.close()
+
+    async def _db(self, callback):
+        return await asyncio.to_thread(self._run_db, callback)
+
     def register(self, app: web.Application) -> None:
         app.router.add_get("/miniapp", self.redirect_to_app)
         app.router.add_get("/miniapp/", self.serve_index)
@@ -149,18 +161,14 @@ class MiniAppService:
 
     async def list_folders(self, request: web.Request) -> web.Response:
         user_id = self._authenticated_user_id(request)
-        conn = get_connection()
-        try:
-            rows = conn.execute(
+        rows = await self._db(lambda conn: conn.execute(
                 """SELECT f.id, f.name, f.emoji, COUNT(i.id) AS item_count
                    FROM vault_folders f
                    LEFT JOIN vault_items i ON i.folder_id = f.id AND i.user_id = f.user_id
                    WHERE f.user_id = ? AND f.archived_at IS NULL
                    GROUP BY f.id ORDER BY f.id ASC""",
                 (user_id,),
-            ).fetchall()
-        finally:
-            conn.close()
+            ).fetchall())
         return web.json_response(
             {"folders": [dict(row) for row in rows]},
             headers={"Cache-Control": "no-store"},
@@ -176,7 +184,8 @@ class MiniAppService:
         if not name:
             raise web.HTTPBadRequest(text="Введи название папки.")
         try:
-            exists = next((folder for folder in VaultService.list_folders(user_id, include_archived=True)
+            folders = await asyncio.to_thread(VaultService.list_folders, user_id, include_archived=True)
+            exists = next((folder for folder in folders
                            if folder["name"].casefold() == name.casefold()), None)
             if exists:
                 raise web.HTTPConflict(text="Папка с таким названием уже есть.")
@@ -186,7 +195,7 @@ class MiniAppService:
             logger.exception("Mini App folder creation failed for user %s", user_id)
             raise web.HTTPInternalServerError(text="Не удалось создать папку.")
         try:
-            folder = VaultService.create_folder(user_id, name)
+            folder = await asyncio.to_thread(VaultService.create_folder, user_id, name)
         except Exception:
             logger.exception("Mini App folder creation failed for user %s", user_id)
             raise web.HTTPInternalServerError(text="Не удалось создать папку.")
@@ -198,17 +207,13 @@ class MiniAppService:
         telegram_user = request.get("telegram_user", {})
         own_username = str(telegram_user.get("username") or "").casefold()
         own_name = " ".join(filter(None, [telegram_user.get("first_name"), telegram_user.get("last_name")])).casefold()
-        conn = get_connection()
-        try:
-            rows = conn.execute(
+        rows = await self._db(lambda conn: conn.execute(
                 """SELECT source_chat_title, sender_username, sender_name, link_domain,
                           COUNT(*) AS item_count, MAX(created_at) AS last_at
                    FROM vault_items WHERE user_id = ?
                    GROUP BY source_chat_title, sender_username, sender_name, link_domain""",
                 (user_id,),
-            ).fetchall()
-        finally:
-            conn.close()
+            ).fetchall())
 
         sources: dict[tuple[str, str], dict] = {}
         for row in rows:
@@ -260,14 +265,10 @@ class MiniAppService:
             raise web.HTTPBadRequest(text="Время напоминания должно быть в будущем.")
         if (due_at - now).total_seconds() > 366 * 24 * 60 * 60:
             raise web.HTTPBadRequest(text="Можно поставить напоминание не дальше чем на год.")
-        conn = get_connection()
-        try:
-            item = conn.execute(
+        item = await self._db(lambda conn: conn.execute(
                 "SELECT id, kind, content, page_title, file_name, tag FROM vault_items WHERE user_id = ? AND id = ?",
                 (user_id, item_id),
-            ).fetchone()
-        finally:
-            conn.close()
+            ).fetchone())
         if not item:
             raise web.HTTPNotFound(text="Материал не найден.")
         title = str(body.get("title") or item["tag"] or item["content"] or item["page_title"] or item["file_name"] or {
@@ -380,57 +381,61 @@ class MiniAppService:
             params.extend([like] * 10)
 
         where = " AND ".join(clauses)
-        conn = get_connection()
-        if not turso_backend:
-            conn.create_function("unicode_lower", 1, lambda value: str(value or "").casefold())
-        try:
-            select_sql = f"""SELECT i.id, i.kind, i.content, i.tag, i.manual_tag, i.file_name,
-                               i.file_size, i.media_type, i.sender_name, i.source_chat_title, i.created_at,
-                               i.sender_username, i.is_forwarded, i.link_domain, i.mime_type, i.duration, i.width, i.height,
-                               i.item_state, i.is_favorite, i.context_text, i.telegram_file_id,
-                               i.media_group_json, i.ocr_text, i.ocr_pending_text, i.ocr_pending_image_index,
-                               i.link_url, i.page_title, f.name AS folder_name, f.emoji AS folder_emoji
-                        FROM vault_items i JOIN vault_folders f ON f.id = i.folder_id
-                        WHERE {where} ORDER BY i.id DESC"""
-            if turso_backend:
-                rows = conn.execute(select_sql, params).fetchall()
-                if source_type:
-                    source_needle = source_value.casefold()
-                    if source_type == "own":
-                        telegram_user = request.get("telegram_user", {})
-                        own_username = str(telegram_user.get("username") or source_value).casefold()
-                        own_name = " ".join(filter(None, [telegram_user.get("first_name"), telegram_user.get("last_name")])).casefold()
-                        rows = [row for row in rows if str(row["sender_username"] or "").casefold() == own_username or str(row["sender_name"] or "").casefold() == own_name]
-                    else:
-                        field = source_columns[source_type]
-                        rows = [row for row in rows if str(row[field] or "").casefold() == source_needle]
-                if tag:
-                    tag_needle = tag.casefold().lstrip("#")
-                    rows = [row for row in rows if tag_needle in str(row["tag"] or "").casefold()]
-                if query:
-                    query_needle = query.casefold()
-                    search_fields = (
-                        "content", "context_text", "ocr_text", "tag", "file_name", "sender_name",
-                        "source_chat_title", "link_url", "page_title", "folder_name",
-                    )
-                    rows = [
-                        row for row in rows
-                        if any(query_needle in str(row[field] or "").casefold() for field in search_fields)
-                    ]
-                total = len(rows)
-                offset = (page - 1) * page_size
-                rows = rows[offset:offset + page_size]
-            else:
-                total = int(conn.execute(
-                    f"SELECT COUNT(*) AS n FROM vault_items i JOIN vault_folders f ON f.id = i.folder_id WHERE {where}",
-                    params,
-                ).fetchone()["n"])
-                rows = conn.execute(
-                    select_sql + " LIMIT ? OFFSET ?",
-                    [*params, page_size, (page - 1) * page_size],
-                ).fetchall()
-        finally:
-            conn.close()
+        def fetch_items():
+            conn = get_connection()
+            if not turso_backend:
+                conn.create_function("unicode_lower", 1, lambda value: str(value or "").casefold())
+            try:
+                select_sql = f"""SELECT i.id, i.kind, i.content, i.tag, i.manual_tag, i.file_name,
+                                   i.file_size, i.media_type, i.sender_name, i.source_chat_title, i.created_at,
+                                   i.sender_username, i.is_forwarded, i.link_domain, i.mime_type, i.duration, i.width, i.height,
+                                   i.item_state, i.is_favorite, i.context_text, i.telegram_file_id,
+                                   i.media_group_json, i.ocr_text, i.ocr_pending_text, i.ocr_pending_image_index,
+                                   i.link_url, i.page_title, f.name AS folder_name, f.emoji AS folder_emoji
+                            FROM vault_items i JOIN vault_folders f ON f.id = i.folder_id
+                            WHERE {where} ORDER BY i.id DESC"""
+                if turso_backend:
+                    rows = conn.execute(select_sql, params).fetchall()
+                    if source_type:
+                        source_needle = source_value.casefold()
+                        if source_type == "own":
+                            telegram_user = request.get("telegram_user", {})
+                            own_username = str(telegram_user.get("username") or source_value).casefold()
+                            own_name = " ".join(filter(None, [telegram_user.get("first_name"), telegram_user.get("last_name")])).casefold()
+                            rows = [row for row in rows if str(row["sender_username"] or "").casefold() == own_username or str(row["sender_name"] or "").casefold() == own_name]
+                        else:
+                            field = source_columns[source_type]
+                            rows = [row for row in rows if str(row[field] or "").casefold() == source_needle]
+                    if tag:
+                        tag_needle = tag.casefold().lstrip("#")
+                        rows = [row for row in rows if tag_needle in str(row["tag"] or "").casefold()]
+                    if query:
+                        query_needle = query.casefold()
+                        search_fields = (
+                            "content", "context_text", "ocr_text", "tag", "file_name", "sender_name",
+                            "source_chat_title", "link_url", "page_title", "folder_name",
+                        )
+                        rows = [
+                            row for row in rows
+                            if any(query_needle in str(row[field] or "").casefold() for field in search_fields)
+                        ]
+                    total = len(rows)
+                    offset = (page - 1) * page_size
+                    rows = rows[offset:offset + page_size]
+                else:
+                    total = int(conn.execute(
+                        f"SELECT COUNT(*) AS n FROM vault_items i JOIN vault_folders f ON f.id = i.folder_id WHERE {where}",
+                        params,
+                    ).fetchone()["n"])
+                    rows = conn.execute(
+                        select_sql + " LIMIT ? OFFSET ?",
+                        [*params, page_size, (page - 1) * page_size],
+                    ).fetchall()
+            finally:
+                conn.close()
+            return rows, total
+
+        rows, total = await asyncio.to_thread(fetch_items)
 
         items = []
         for row in rows:
@@ -465,9 +470,7 @@ class MiniAppService:
     async def get_item(self, request: web.Request) -> web.Response:
         user_id = self._authenticated_user_id(request)
         item_id = int(request.match_info["item_id"])
-        conn = get_connection()
-        try:
-            row = conn.execute(
+        row = await self._db(lambda conn: conn.execute(
                 """SELECT i.id, i.kind, i.content, i.tag, i.manual_tag, i.file_name,
                           i.file_size, i.media_type, i.mime_type, i.duration, i.width, i.height,
                           i.sender_name, i.sender_username, i.is_forwarded, i.source_chat_title, i.created_at,
@@ -478,9 +481,7 @@ class MiniAppService:
                    FROM vault_items i JOIN vault_folders f ON f.id = i.folder_id
                    WHERE i.user_id = ? AND i.id = ? AND f.archived_at IS NULL""",
                 (user_id, item_id),
-            ).fetchone()
-        finally:
-            conn.close()
+            ).fetchone())
         if not row:
             raise web.HTTPNotFound(text="Материал не найден.")
         item = dict(row)
@@ -522,91 +523,95 @@ class MiniAppService:
         except (TypeError, ValueError):
             raise web.HTTPBadRequest(text="В списке есть некорректный материал.")
 
-        conn = get_connection()
         telegram_messages_total = 0
         telegram_messages_removed = 0
-        try:
-            placeholders = ",".join("?" for _ in item_ids)
-            rows = conn.execute(
-                f"""SELECT id, folder_id, tag, manual_tag, archive_chat_id,
-                          archive_message_id, archive_message_ids, context_message_id
-                   FROM vault_items WHERE user_id = ? AND id IN ({placeholders})""",
-                [user_id, *item_ids],
-            ).fetchall()
-            if len(rows) != len(item_ids):
-                raise web.HTTPNotFound(text="Часть выбранных материалов больше недоступна.")
+        def apply_bulk_action():
+            conn = get_connection()
+            try:
+                placeholders = ",".join("?" for _ in item_ids)
+                rows = conn.execute(
+                    f"""SELECT id, folder_id, tag, manual_tag, archive_chat_id,
+                              archive_message_id, archive_message_ids, context_message_id
+                       FROM vault_items WHERE user_id = ? AND id IN ({placeholders})""",
+                    [user_id, *item_ids],
+                ).fetchall()
+                if len(rows) != len(item_ids):
+                    raise web.HTTPNotFound(text="Часть выбранных материалов больше недоступна.")
 
-            if action == "move":
-                try:
-                    folder_id = int(body.get("folder_id"))
-                except (TypeError, ValueError):
-                    raise web.HTTPBadRequest(text="Выбери папку.")
-                folder = conn.execute(
-                    "SELECT id FROM vault_folders WHERE id = ? AND user_id = ? AND archived_at IS NULL",
-                    (folder_id, user_id),
-                ).fetchone()
-                if not folder:
-                    raise web.HTTPBadRequest(text="Папка недоступна.")
-                conn.execute(
-                    f"UPDATE vault_items SET folder_id = ? WHERE user_id = ? AND id IN ({placeholders})",
-                    [folder_id, user_id, *item_ids],
-                )
-            elif action == "state":
-                state = body.get("state")
-                if state not in VALID_STATES:
-                    raise web.HTTPBadRequest(text="Неизвестный статус.")
-                conn.execute(
-                    f"UPDATE vault_items SET item_state = ? WHERE user_id = ? AND id IN ({placeholders})",
-                    [state, user_id, *item_ids],
-                )
-            elif action == "favorite":
-                value = 1 if body.get("favorite") else 0
-                stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()) if value else None
-                conn.execute(
-                    f"UPDATE vault_items SET is_favorite = ?, favorited_at = ? WHERE user_id = ? AND id IN ({placeholders})",
-                    [value, stamp, user_id, *item_ids],
-                )
-            elif action == "delete":
-                if len(item_ids) > 25:
-                    raise web.HTTPBadRequest(text="Для удаления можно выбрать не больше 25 материалов за раз.")
-                conn.execute(
-                    f"DELETE FROM reminders WHERE user_id = ? AND source_item_id IN ({placeholders})",
-                    [user_id, *item_ids],
-                )
-                conn.execute(
-                    f"DELETE FROM vault_items WHERE user_id = ? AND id IN ({placeholders})",
-                    [user_id, *item_ids],
-                )
-            elif action == "tag":
-                tag = format_tags(str(body.get("tag") or "").strip()[:64])
-                if not tag:
-                    raise web.HTTPBadRequest(text="Введи тег минимум из одного символа.")
-                mode = body.get("mode", "add")
-                if mode not in {"add", "replace"}:
-                    raise web.HTTPBadRequest(text="Неизвестный режим работы с тегом.")
-                for row in rows:
-                    if mode == "replace":
-                        manual = tag
-                        merged = tag
-                    else:
-                        manual = merge_user_tags(row["manual_tag"], [tag])
-                        merged = merge_user_tags(row["tag"], [tag])
+                if action == "move":
+                    try:
+                        folder_id = int(body.get("folder_id"))
+                    except (TypeError, ValueError):
+                        raise web.HTTPBadRequest(text="Выбери папку.")
+                    folder = conn.execute(
+                        "SELECT id FROM vault_folders WHERE id = ? AND user_id = ? AND archived_at IS NULL",
+                        (folder_id, user_id),
+                    ).fetchone()
+                    if not folder:
+                        raise web.HTTPBadRequest(text="Папка недоступна.")
                     conn.execute(
-                        "UPDATE vault_items SET tag = ?, manual_tag = ? WHERE user_id = ? AND id = ?",
-                        (merged, manual, user_id, row["id"]),
+                        f"UPDATE vault_items SET folder_id = ? WHERE user_id = ? AND id IN ({placeholders})",
+                        [folder_id, user_id, *item_ids],
                     )
-            else:
-                raise web.HTTPBadRequest(text="Неизвестное групповое действие.")
-            conn.commit()
-        except web.HTTPException:
-            conn.rollback()
-            raise
-        except Exception:
-            conn.rollback()
-            logger.exception("Mini App bulk action failed for user %s", user_id)
-            raise web.HTTPInternalServerError(text="Не удалось обновить материалы.")
-        finally:
-            conn.close()
+                elif action == "state":
+                    state = body.get("state")
+                    if state not in VALID_STATES:
+                        raise web.HTTPBadRequest(text="Неизвестный статус.")
+                    conn.execute(
+                        f"UPDATE vault_items SET item_state = ? WHERE user_id = ? AND id IN ({placeholders})",
+                        [state, user_id, *item_ids],
+                    )
+                elif action == "favorite":
+                    value = 1 if body.get("favorite") else 0
+                    stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()) if value else None
+                    conn.execute(
+                        f"UPDATE vault_items SET is_favorite = ?, favorited_at = ? WHERE user_id = ? AND id IN ({placeholders})",
+                        [value, stamp, user_id, *item_ids],
+                    )
+                elif action == "delete":
+                    if len(item_ids) > 25:
+                        raise web.HTTPBadRequest(text="Для удаления можно выбрать не больше 25 материалов за раз.")
+                    conn.execute(
+                        f"DELETE FROM reminders WHERE user_id = ? AND source_item_id IN ({placeholders})",
+                        [user_id, *item_ids],
+                    )
+                    conn.execute(
+                        f"DELETE FROM vault_items WHERE user_id = ? AND id IN ({placeholders})",
+                        [user_id, *item_ids],
+                    )
+                elif action == "tag":
+                    tag = format_tags(str(body.get("tag") or "").strip()[:64])
+                    if not tag:
+                        raise web.HTTPBadRequest(text="Введи тег минимум из одного символа.")
+                    mode = body.get("mode", "add")
+                    if mode not in {"add", "replace"}:
+                        raise web.HTTPBadRequest(text="Неизвестный режим работы с тегом.")
+                    for row in rows:
+                        if mode == "replace":
+                            manual = tag
+                            merged = tag
+                        else:
+                            manual = merge_user_tags(row["manual_tag"], [tag])
+                            merged = merge_user_tags(row["tag"], [tag])
+                        conn.execute(
+                            "UPDATE vault_items SET tag = ?, manual_tag = ? WHERE user_id = ? AND id = ?",
+                            (merged, manual, user_id, row["id"]),
+                        )
+                else:
+                    raise web.HTTPBadRequest(text="Неизвестное групповое действие.")
+                conn.commit()
+            except web.HTTPException:
+                conn.rollback()
+                raise
+            except Exception:
+                conn.rollback()
+                logger.exception("Mini App bulk action failed for user %s", user_id)
+                raise web.HTTPInternalServerError(text="Не удалось обновить материалы.")
+            finally:
+                conn.close()
+            return rows
+
+        rows = await asyncio.to_thread(apply_bulk_action)
         if action == "delete":
             for row in rows:
                 chat_id = int(row["archive_chat_id"] or user_id)
@@ -639,14 +644,10 @@ class MiniAppService:
     async def photo_preview(self, request: web.Request) -> web.StreamResponse:
         user_id = self._authenticated_user_id(request)
         item_id = int(request.match_info["item_id"])
-        conn = get_connection()
-        try:
-            row = conn.execute(
+        row = await self._db(lambda conn: conn.execute(
                 "SELECT telegram_file_id, media_group_json, kind, mime_type FROM vault_items WHERE user_id = ? AND id = ?",
                 (user_id, item_id),
-            ).fetchone()
-        finally:
-            conn.close()
+            ).fetchone())
         try:
             index = max(0, min(int(request.query.get("index", "0")), 9))
         except ValueError:
@@ -713,14 +714,10 @@ class MiniAppService:
             raise web.HTTPBadRequest(text="Некорректный номер картинки.")
         if image_index < 0:
             raise web.HTTPBadRequest(text="Некорректный номер картинки.")
-        conn = get_connection()
-        try:
-            row = conn.execute(
+        row = await self._db(lambda conn: conn.execute(
                 "SELECT telegram_file_id, media_group_json, kind, mime_type, file_name FROM vault_items WHERE user_id = ? AND id = ?",
                 (user_id, item_id),
-            ).fetchone()
-        finally:
-            conn.close()
+            ).fetchone())
         media_group = _media_group(row) if row else []
         if not row or image_index >= len(media_group):
             raise web.HTTPNotFound(text="Фото не найдено.")
@@ -737,7 +734,8 @@ class MiniAppService:
         except Exception as exc:
             logger.warning("Mini App OCR failed for user=%s item=%s (%s)", user_id, item_id, type(exc).__name__)
             raise web.HTTPBadGateway(text="Не удалось распознать текст. Попробуй ещё раз.")
-        if not VaultService.propose_item_ocr(user_id, item_id, text, image_index):
+        proposed = await asyncio.to_thread(VaultService.propose_item_ocr, user_id, item_id, text, image_index)
+        if not proposed:
             raise web.HTTPNotFound(text="Материал не найден.")
         return web.json_response({"text": text, "image_index": image_index}, headers={"Cache-Control": "no-store"})
 
@@ -746,7 +744,7 @@ class MiniAppService:
         if not is_owner_user(user_id, self.settings):
             raise web.HTTPForbidden(text="Доступно только владельцу бота.")
         item_id = int(request.match_info["item_id"])
-        item = VaultService.accept_item_ocr(user_id, item_id)
+        item = await asyncio.to_thread(VaultService.accept_item_ocr, user_id, item_id)
         if not item:
             raise web.HTTPNotFound(text="Предложение OCR уже закрыто или материал удалён.")
         return web.json_response({"ocr_text": item["ocr_text"] or ""}, headers={"Cache-Control": "no-store"})
@@ -756,7 +754,7 @@ class MiniAppService:
         if not is_owner_user(user_id, self.settings):
             raise web.HTTPForbidden(text="Доступно только владельцу бота.")
         item_id = int(request.match_info["item_id"])
-        item = VaultService.cancel_item_ocr(user_id, item_id)
+        item = await asyncio.to_thread(VaultService.cancel_item_ocr, user_id, item_id)
         if not item:
             raise web.HTTPNotFound(text="Предложение OCR уже закрыто или материал удалён.")
         return web.json_response({"ok": True}, headers={"Cache-Control": "no-store"})
@@ -770,14 +768,10 @@ class MiniAppService:
     async def media_link(self, request: web.Request) -> web.Response:
         user_id = self._authenticated_user_id(request)
         item_id = int(request.match_info["item_id"])
-        conn = get_connection()
-        try:
-            row = conn.execute(
+        row = await self._db(lambda conn: conn.execute(
                 "SELECT telegram_file_id, media_group_json, kind, mime_type, file_name FROM vault_items WHERE user_id = ? AND id = ?",
                 (user_id, item_id),
-            ).fetchone()
-        finally:
-            conn.close()
+            ).fetchone())
         media_group = _media_group(row) if row else []
         if not row or not media_group:
             raise web.HTTPNotFound(text="Файл у этого материала не найден.")
@@ -804,14 +798,10 @@ class MiniAppService:
         if not hmac.compare_digest(expected, signature) and not ("index" not in request.query and hmac.compare_digest(legacy_expected, signature)):
             raise web.HTTPUnauthorized(text="Ссылка на файл недействительна.")
 
-        conn = get_connection()
-        try:
-            row = conn.execute(
+        row = await self._db(lambda conn: conn.execute(
                 "SELECT telegram_file_id, media_group_json, kind, mime_type, file_name FROM vault_items WHERE user_id = ? AND id = ?",
                 (user_id, item_id),
-            ).fetchone()
-        finally:
-            conn.close()
+            ).fetchone())
         media_group = _media_group(row) if row else []
         if not row or index >= len(media_group):
             raise web.HTTPNotFound(text="Файл не найден.")
