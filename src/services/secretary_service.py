@@ -306,6 +306,48 @@ class SecretaryService:
             "DELETE FROM secretary_update_failures WHERE update_id=?", (update_id,)
         ))
 
+    async def _list_update_failures(self, limit: int = 20):
+        def load(conn):
+            rows = conn.execute(
+                "SELECT update_id, error, attempts, updated_at FROM secretary_update_failures "
+                "WHERE dead_letter=1 ORDER BY updated_at DESC LIMIT ?", (max(1, min(50, limit)),)
+            ).fetchall()
+            return [_row_to_dict(row) for row in rows]
+        return await self._db(load)
+
+    async def _get_update_failure(self, update_id: int):
+        return await self._db(lambda conn: _row_to_dict(conn.execute(
+            "SELECT payload FROM secretary_update_failures WHERE update_id=? AND dead_letter=1",
+            (int(update_id),),
+        ).fetchone()))
+
+    async def _show_update_failures(self, chat_id: int, message_id: int | None = None):
+        failures = await self._list_update_failures()
+        if not failures:
+            await self._render_control_panel(chat_id, "Очередь отказавших обновлений пуста.", [
+                [{"text": "🏠 Меню", "callback_data": "hist:menu"}],
+            ], message_id)
+            return
+        keyboard = []
+        for row in failures:
+            error = str(row.get("error") or "ошибка")[:42]
+            keyboard.append([{"text": f"↻ #{row['update_id']} · {error}",
+                              "callback_data": f"fail:retry:{int(row['update_id'])}"}])
+        keyboard.append([{"text": "🔄 Обновить", "callback_data": "fail:list"}])
+        keyboard.append([{"text": "🏠 Меню", "callback_data": "hist:menu"}])
+        await self._render_control_panel(chat_id,
+            "Обновления, которые трижды завершились ошибкой. Нажатие «повторить» запускает их обработчик ещё раз; если ошибка была после внешнего действия, возможен повтор этого действия.",
+            keyboard, message_id)
+
+    async def _retry_update_failure(self, update_id: int) -> bool:
+        row = await self._get_update_failure(update_id)
+        if not row:
+            return False
+        update = json.loads(row["payload"])
+        await self._handle_update(update)
+        await self._clear_update_failure(update_id)
+        return True
+
     async def _list_chats(self):
         def load(conn):
             rows = conn.execute(
@@ -453,7 +495,11 @@ class SecretaryService:
             "Команды `.mute`, `.unmute` и `.typing` не отправляют текст собеседнику.\n"
             "/deleted — архив удалённых сообщений по авторам\n"
             "/edited — архив изменений по авторам\n"
-            "/chats — выбрать чат заново", [[{"text": "🏠 Меню", "callback_data": "hist:menu"}]])
+            "/failures — очередь ошибок\n"
+            "/chats — выбрать чат заново", [
+                [{"text": "🧾 Ошибки", "callback_data": "fail:list"}],
+                [{"text": "🏠 Меню", "callback_data": "hist:menu"}],
+            ])
 
     async def _send_dm_menu(self, chat_id: int, message_id: int | None = None):
         await self._render_control_panel(chat_id,
@@ -853,6 +899,30 @@ class SecretaryService:
             elif parts[1] in {"deleted", "edited"} and len(parts) == 3:
                 await self._show_history(chat_id, parts[1], max(0, int(parts[2])))
             return
+        if callback_data.startswith("fail:"):
+            parts = callback_data.split(":")
+            await self._api("answerCallbackQuery", {"callback_query_id": query.get("id"), "text": "Обрабатываю…"})
+            chat_id = int((message.get("chat") or {}).get("id") or self.owner_id)
+            message_id = int(message.get("message_id") or 0) or None
+            if len(parts) == 2 and parts[1] == "list":
+                await self._show_update_failures(chat_id, message_id)
+            elif len(parts) == 3 and parts[1] == "retry":
+                try:
+                    succeeded = await self._retry_update_failure(int(parts[2]))
+                except Exception:
+                    logger.exception("Secretary manual update replay failed update_id=%s", parts[2])
+                    await self._render_control_panel(chat_id,
+                        f"Повтор #{parts[2]} снова завершился ошибкой. Запись оставлена в очереди.", [
+                            [{"text": "↻ Повторить", "callback_data": f"fail:retry:{int(parts[2])}"}],
+                            [{"text": "⬅️ К отказам", "callback_data": "fail:list"}],
+                        ], message_id)
+                else:
+                    status = "Обновление обработано и удалено из очереди." if succeeded else "Обновление уже обработано или отсутствует в очереди."
+                    await self._render_control_panel(chat_id, status, [
+                        [{"text": "🧾 Очередь отказов", "callback_data": "fail:list"}],
+                        [{"text": "🏠 Меню", "callback_data": "hist:menu"}],
+                    ], message_id)
+            return
         if not callback_data.startswith("sec:"):
             await self._api("answerCallbackQuery", {"callback_query_id": query.get("id"), "text": "Некорректная кнопка"})
             return
@@ -907,6 +977,9 @@ class SecretaryService:
             return
         if command in {"/edited", "✏️ изменённые сообщения"}:
             await self._show_history(chat_id, "edited")
+            return
+        if command in {"/failures", "🧾 отказавшие обновления"}:
+            await self._show_update_failures(chat_id)
             return
         if command in {"/help"}:
             await self._send_dm_help(chat_id)
@@ -1462,6 +1535,7 @@ class SecretaryService:
                 {"command": "chats", "description": "Выбрать чат"},
                 {"command": "deleted", "description": "Архив удалённых по авторам"},
                 {"command": "edited", "description": "Архив изменений по авторам"},
+                {"command": "failures", "description": "Очередь отказавших обновлений"},
                 {"command": "help", "description": "Помощь"},
                 {"command": "cancel", "description": "Сбросить выбранный чат"},
             ]}),
